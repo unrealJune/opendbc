@@ -51,7 +51,7 @@ BO_ 644 RADAR_TRACK_1: 8 RADAR
  SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
  SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
-BO_ 720 RADAR_TRACK_2: 8 RADAR
+BO_ 648 RADAR_TRACK_2: 8 RADAR
  SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
  SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
  SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
@@ -59,7 +59,7 @@ BO_ 720 RADAR_TRACK_2: 8 RADAR
  SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
  SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
-BO_ 724 RADAR_TRACK_3: 8 RADAR
+BO_ 652 RADAR_TRACK_3: 8 RADAR
  SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
  SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
  SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
@@ -67,7 +67,7 @@ BO_ 724 RADAR_TRACK_3: 8 RADAR
  SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
  SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
-BO_ 728 RADAR_TRACK_4: 8 RADAR
+BO_ 720 RADAR_TRACK_4: 8 RADAR
  SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
  SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
  SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
@@ -75,7 +75,23 @@ BO_ 728 RADAR_TRACK_4: 8 RADAR
  SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
  SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
-BO_ 732 RADAR_TRACK_5: 8 RADAR
+BO_ 724 RADAR_TRACK_5: 8 RADAR
+ SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
+ SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
+ SG_ RANGE_RAW : 23|16@0+ (1,0) [0|65535] "" XXX
+ SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
+ SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 728 RADAR_TRACK_6: 8 RADAR
+ SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
+ SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
+ SG_ RANGE_RAW : 23|16@0+ (1,0) [0|65535] "" XXX
+ SG_ LAT_RAW : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
+ SG_ CNTR : 63|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 732 RADAR_TRACK_7: 8 RADAR
  SG_ STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
  SG_ TRACK_TAG : 15|8@0+ (1,0) [0|255] "" XXX
  SG_ RANGE : 23|16@0+ (0.00357,-3) [-3|230] "m" XXX
@@ -101,13 +117,15 @@ BO_ 713 RADAR_SELECTED_1: 8 RADAR
  SG_ SEL_CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
 
-CM_ "Stock 36802-TBA Bosch radar FINE per-track object table. Big-endian (Motorola), all frames DLC8. The radar broadcasts 6 track records, each a 4-frame burst on consecutive IDs; only the HEADER ID of each record (0x280/0x284/0x2D0/0x2D4/0x2D8/0x2DC) carries RANGE, and only on the sub-frame where B1==0x74 (the range-carrier header tag). The other 3 sub-frames of each record (0x281-0x283, 0x285-0x287, 0x2D1-0x2D3, ...) carry lateral/velocity/status and would decode to spurious sub-zero range -- they are deliberately NOT declared, so the parser never reads them as range. The parser GATES on TRACK_TAG(B1)==0x74. Sentinels (any one -> not an active track): STRENGTH(B0)==0xFE (idle), RANGE_RAW(B2:B3)==0x8000 (~114m unset), RANGE_RAW>=0xFF80 (~230m saturation rail). RANGE and RANGE_RAW intentionally overlap B2:B3 (scaled meters vs raw int for the sentinel test) -- opendbc decodes overlapping signals independently. RANGE scale/offset (0.00357, -3.0) is cross-car-validated; the offset -3.0 is tape-anchored. LAT_RAW is offset-binary (raw 0x8000 = center, declared with offset -32768); its physical m/LSB is NOT pinned, so the parser applies a clearly-placeholdered LAT_SCALE and yRel magnitude is DO_NOT_TRUST until a controlled lateral cal. vRel is NOT published by the radar on the FINE 0x280 frames; the parser derives it as d(dRel)/dt per track. 0x2C8/0x2C9 (RADAR_SELECTED) remain declared as a coarse, RX-only reference and are NOT read by the fine parser; their byte layout was RE-DERIVED 2026-06-30 against the clean vision lead (see BO_ 712 comment) -- the prior LONG_DIST@B0:B1 / REL_SPEED@(0.25,-31.25) layout was WRONG. REL_SPEED is the byte-6 coarse relative velocity, now CALIBRATED (vRel = -0.7*(B6-124) m/s, r=0.90 vs vision).";
-CM_ BO_ 640 "Track slot 0 header (record 0x280-0x283). Range carrier when TRACK_TAG(B1)==0x74. Head of the 6-slot sweep burst.";
+CM_ "Stock 36802-TBA Bosch radar FINE per-track object table. Big-endian (Motorola), all frames DLC8. The radar broadcasts up to 8 track records, each a 4-frame burst on consecutive IDs; only the HEADER ID of each record (0x280/0x284/0x288/0x28C/0x2D0/0x2D4/0x2D8/0x2DC, a near group 0x280-0x28C + a far group 0x2D0-0x2DC) carries RANGE, and only on the sub-frame where B1 in {0x74 moving, 0x94 stationary} (the range-carrier header tags). The other 3 sub-frames of each record (0x281-0x283, 0x285-0x287, 0x2D1-0x2D3, ...) carry lateral/velocity/status and would decode to spurious sub-zero range -- they are deliberately NOT declared, so the parser never reads them as range. NOTE 2026-07-01: slots 0x288/0x28C were previously undeclared (a 6-slot list) and are actually the busiest MID-range slots (~62 m); the old list instead polled the near-dead far slots. Reading all 8 is the correct full-table decode -- but an offline replay of both phantom-fix drives showed it is NEUTRAL for the 40-70 m follow-too-far/false-closing symptom (only ~8% of the added points are the lead; that symptom is a radard fusion issue -- see tmp_radar/RADARD_HANDOFF.md and the BO_ 648 comment). The parser GATES on TRACK_TAG(B1) in {0x74,0x94}. Sentinels (any one -> not an active track): STRENGTH(B0)==0xFE (idle), RANGE_RAW(B2:B3)==0x8000 (~114m unset), RANGE_RAW>=0xFF80 (~230m saturation rail). RANGE and RANGE_RAW intentionally overlap B2:B3 (scaled meters vs raw int for the sentinel test) -- opendbc decodes overlapping signals independently. RANGE scale/offset (0.00357, -3.0) is cross-car-validated; the offset -3.0 is tape-anchored. LAT_RAW is offset-binary (raw 0x8000 = center, declared with offset -32768); its physical m/LSB is NOT pinned, so the parser applies a clearly-placeholdered LAT_SCALE and yRel magnitude is DO_NOT_TRUST until a controlled lateral cal. vRel is NOT published by the radar on the FINE 0x280 frames; the parser derives it as d(dRel)/dt per track. 0x2C8/0x2C9 (RADAR_SELECTED) remain declared as a coarse, RX-only reference and are NOT read by the fine parser; their byte layout was RE-DERIVED 2026-06-30 against the clean vision lead (see BO_ 712 comment) -- the prior LONG_DIST@B0:B1 / REL_SPEED@(0.25,-31.25) layout was WRONG. REL_SPEED is the byte-6 coarse relative velocity, now CALIBRATED (vRel = -0.7*(B6-124) m/s, r=0.90 vs vision).";
+CM_ BO_ 640 "Track slot 0 header (record 0x280-0x283). Range carrier when TRACK_TAG(B1) in {0x74 moving, 0x94 stationary}. Head of the 8-slot sweep burst.";
 CM_ BO_ 644 "Track slot 1 header (record 0x284-0x287).";
-CM_ BO_ 720 "Track slot 2 header (record 0x2D0-0x2D3).";
-CM_ BO_ 724 "Track slot 3 header (record 0x2D4-0x2D7).";
-CM_ BO_ 728 "Track slot 4 header (record 0x2D8-0x2DB).";
-CM_ BO_ 732 "Track slot 5 header (record 0x2DC-0x2DF). Sweep terminator; the parser's trigger_msg (S4 sweep-coherent emit).";
+CM_ BO_ 648 "Track slot 2 header (record 0x288-0x28B). Mid-range near-group slot (valid ~30% of sweeps, median range ~62 m). ADDED 2026-07-01: the old 6-slot parser SKIPPED this while polling the near-dead far slots 0x2D4/0x2D8/0x2DC (valid 1%/0%/0%). Reading it is the correct full-table decode; VALIDATION (tmp_radar/validate_replay.py on drives 00000002/00000003) found it NEUTRAL for the 40-70 m follow-too-far symptom -- ~92% of these points are OTHER objects, not the lead, so lead coverage was unchanged. The follow-too-far/false-closing is a radard fusion issue (closer near-slot object vs vision lead), NOT this. Evidence: tmp_radar/slot_map.py, RADARD_HANDOFF.md.";
+CM_ BO_ 652 "Track slot 3 header (record 0x28C-0x28F). Mid-range near-group slot (valid ~12%, median ~62 m). ADDED 2026-07-01 alongside slot 2 (0x288); see that comment.";
+CM_ BO_ 720 "Track slot 4 header (record 0x2D0-0x2D3). Far-group slot (valid ~3%).";
+CM_ BO_ 724 "Track slot 5 header (record 0x2D4-0x2D7). Far-group slot (valid ~1%).";
+CM_ BO_ 728 "Track slot 6 header (record 0x2D8-0x2DB). Far-group slot (rarely valid).";
+CM_ BO_ 732 "Track slot 7 header (record 0x2DC-0x2DF). Sweep terminator; the parser's trigger_msg (S4 sweep-coherent emit). Stays LAST in the sweep so adding slots 2/3 does not disturb trigger coherence.";
 CM_ SG_ 640 STRENGTH "B0 raw, unscaled. Co-varies with range (return strength, not a flag). Used as the idle sentinel (==0xFE -> no track).";
 CM_ SG_ 640 TRACK_TAG "B1 raw. The range-carrier header tag. Parser GATES on ==0x74; any other value is a non-range sub-frame mux'd onto this ID -> SKIP (do not read RANGE).";
 CM_ SG_ 640 RANGE "B2:B3 BE16 -> meters. range = 0.00357*raw - 3.0. Scale cross-car-validated (corpus median 0.00357, R^2=0.975 vs fused dRel); offset -3.0 tape-anchored. 16-bit int, no float / no SIG_VALTYPE_ -- the parser consumes meters directly.";

@@ -19,15 +19,34 @@ def _create_nidec_can_parser(car_fingerprint):
 # 36802-TBA Bosch radar FINE per-track object table (0x280 block).
 # Cross-car CONFIRMED 2026-06-07 (3 cars / 6 routes; 8905 tracks fused leadOne.dRel at R^2=0.975).
 # This SUPERSEDES the coarse 0x2C8/0x2C9 selected-lead as the range source: the radar broadcasts up to
-# 6 track records, each a 4-frame burst on consecutive IDs. Only the HEADER ID of each record carries
+# 8 track records, each a 4-frame burst on consecutive IDs. Only the HEADER ID of each record carries
 # RANGE, and only on the sub-frame tagged b1==0x74 (moving) OR b1==0x94 (stationary/decelerating motion
 # class). Both share the SAME byte layout; the tag high nibble encodes motion class (7=moving, 9=stationary).
 # The parser gates on BOSCH_RADAR_HDR_TAG_SET, skips idle/saturation
-# sentinels, emits up to 6 RadarPoints (stable trackId per slot), and lets radard select the lead.
+# sentinels, emits up to 8 RadarPoints (stable trackId per slot), and lets radard select the lead.
 # IMPORTANT: these object frames are physically on openpilot CanBus.camera (rlog src=2, confirmed
 # across 6 routes), NOT CanBus.radar (bus 0). The Bus.radar key below is only the DBC-name lookup;
 # the parser's CAN bus is CanBus(CP).camera. Reconfirm the bus with a read-only sniff before trusting dRel.
-BOSCH_RADAR_HDR_MSGS = [0x280, 0x284, 0x2D0, 0x2D4, 0x2D8, 0x2DC]
+#
+# SLOT LIST -- the 8 header IDs in SWEEP/TRANSMIT ORDER (address-ascending; 0x280 leads, 0x2DC terminates,
+# confirmed on-wire 2026-07-01). slot index == position in this list == trackId // TRACKID_STRIDE.
+# 0x288 and 0x28C were ADDED 2026-07-01 (phantom-fix drives 00000002/00000003): a per-header validity sniff
+# (tmp_radar/slot_map.py) showed the radar fills a near GROUP {0x280,0x284,0x288,0x28C} + a far GROUP
+# {0x2D0,0x2D4,0x2D8,0x2DC}, but the OLD 6-slot list read the near group only PARTIALLY -- it polled the
+# far slots 0x2D4/0x2D8/0x2DC (valid 1%/0%/0% of sweeps) while SKIPPING 0x288 (valid ~30%, 1059 tracks,
+# median ~62 m) and 0x28C (~12%, 433 tracks). Reading the full 8-slot table is the physically-correct decode
+# and gives fuller mid/far object coverage. 0x2DC stays LAST -> the sweep-coherent trigger (S4) is unaffected.
+#
+# SCOPE / VALIDATION (be honest): this was investigated as a fix for the 40-70 m false-closing / follow-too-far
+# symptom, but an offline old-6-slot-vs-new-8-slot replay of both drives (tmp_radar/validate_replay.py,
+# diag_lateral.py) showed it is NEUTRAL for that symptom -- only ~8% of the added-slot points are the actual
+# vision lead (92% are OTHER objects), so lead coverage barely moved (22%->23%) and the false-closing did not
+# drop. It is also NEUTRAL for phantom risk (closer-in-path frames 6.9%->7.0%). The real cause of the
+# follow-too-far / jumping-chevron / tunnel-wall-phantom is radard (openpilot) fusing a CLOSER near-slot object
+# than the vision lead and flip-flopping leadOne between them; the parser's per-slot vRel is faithful to the
+# measured range motion. See tmp_radar/RADARD_HANDOFF.md. Kept here as a correctness/coverage improvement, NOT
+# as the symptom fix.
+BOSCH_RADAR_HDR_MSGS = [0x280, 0x284, 0x288, 0x28C, 0x2D0, 0x2D4, 0x2D8, 0x2DC]
 
 # Range-carrier header tags: sub-frames with b1==0x74 (moving) OR b1==0x94 (stationary/decelerating
 # motion class) carry RANGE in b2:b3 with the SAME byte layout. High nibble = motion class (7=moving,
@@ -440,9 +459,10 @@ class RadarInterface(RadarInterfaceBase):
     return rec
 
   def _update_bosch(self, updated_messages):
-    # FINE per-track object table (0x280 block). Fixed slot map (0x280->slot0 ... 0x2DC->slot5).
+    # FINE per-track object table (0x280 block). Fixed slot map (0x280->slot0, 0x284->slot1, 0x288->slot2,
+    # 0x28C->slot3, 0x2D0->slot4, 0x2D4->slot5, 0x2D8->slot6, 0x2DC->slot7); see BOSCH_RADAR_HDR_MSGS.
     # RX-parse only; never takes 0x1DF / longitudinal authority, so factory AEB/CMBS stays fully live.
-    # Up to 6 RadarPoints are emitted; radard selects leadOne/leadTwo (we do NOT select in advance).
+    # Up to 8 RadarPoints are emitted; radard selects leadOne/leadTwo (we do NOT select in advance).
     #
     # trackId is slot*STRIDE + incarnation (S1, no-reuse). vRel is NOT published on these frames (rlog-
     # confirmed b4:b5 is azimuth, not range-rate), so it is DERIVED per-SLOT as d(dRel)/dt across cycles

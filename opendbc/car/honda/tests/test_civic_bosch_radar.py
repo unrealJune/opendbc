@@ -194,19 +194,19 @@ class TestCivicBoschFineParser(unittest.TestCase):
     dt_ns = int(0.05 * 1e9)
 
     def burst(ns, cntr):
-      return self._emit(ns, [self._f(0x280, _hdr_frame(3000, cntr=cntr)),   # slot 0
-                             self._f(0x284, _hdr_frame(4000, cntr=cntr)),   # slot 1
-                             self._f(0x2D0, _hdr_frame(5000, cntr=cntr))], cntr)  # slot 2
+      return self._emit(ns, [self._f(0x280, _hdr_frame(3000, cntr=cntr)),   # slot 0 (near head)
+                             self._f(0x288, _hdr_frame(4000, cntr=cntr)),   # slot 2 (mid, added 2026-07-01)
+                             self._f(0x2D0, _hdr_frame(5000, cntr=cntr))], cntr)  # slot 4 (far group)
     rr = None
     for k in range(self.WARM_CYCLES):   # born + settled -> all three emit
       rr = burst(k * dt_ns, (0x10 + k) & 0xFF)
     self.assertEqual(len(rr.points), 3)
     # S1: trackId = slot*STRIDE + incarnation(=1); decode the slot back out to verify the 3 distinct slots.
     by_slot = {p.trackId // BOSCH_RADAR_TRACKID_STRIDE: p for p in rr.points}
-    self.assertEqual(set(by_slot), {0, 1, 2})
+    self.assertEqual(set(by_slot), {0, 2, 4})
     self.assertAlmostEqual(by_slot[0].dRel, 0.00357 * 3000 - 3.0, places=4)
-    self.assertAlmostEqual(by_slot[1].dRel, 0.00357 * 4000 - 3.0, places=4)
-    self.assertAlmostEqual(by_slot[2].dRel, 0.00357 * 5000 - 3.0, places=4)
+    self.assertAlmostEqual(by_slot[2].dRel, 0.00357 * 4000 - 3.0, places=4)
+    self.assertAlmostEqual(by_slot[4].dRel, 0.00357 * 5000 - 3.0, places=4)
     # All three are first-incarnation distinct trackIds (no reuse across slots).
     self.assertEqual(len({p.trackId for p in rr.points}), 3)
 
@@ -432,8 +432,8 @@ class TestCivicBoschFineSafeParity(unittest.TestCase):
     return self.ri.update(_can(k * self.dt_ns, list(body) + [self._trig(cntr)]))
 
   def _emit_full(self, k, slot0_frame, trig_cntr):
-    # Drive a FULL 6-header sweep (so the CANParser reaches can_valid). slot 0 carries slot0_frame; slots
-    # 1..5 (including the 0x2DC terminator) are benign sentinels carrying trig_cntr. Used for S3 faults,
+    # Drive a FULL 8-header sweep (so the CANParser reaches can_valid). slot 0 carries slot0_frame; slots
+    # 1..7 (including the 0x2DC terminator) are benign sentinels carrying trig_cntr. Used for S3 faults,
     # which are gated on can_valid (a fault must not fire on a not-yet-valid bus).
     frames = [self._f(0x280, slot0_frame)]
     for a in BOSCH_RADAR_HDR_MSGS[1:]:
@@ -603,7 +603,7 @@ class TestCivicBoschFineRealCapture(unittest.TestCase):
 
   @classmethod
   def _load_sweeps(cls, path):
-    # Load all 6 header IDs (bus 2) in arrival order and group into sweeps. A sweep boundary is each new
+    # Load all 8 header IDs (bus 2) in arrival order and group into sweeps. A sweep boundary is each new
     # 0x280 (head of burst); each sweep's frames are replayed together so the 0x2DC terminator triggers
     # a single coherent emit per sweep (S4). Returns a list of sweeps, each a list of (addr, bytes).
     import csv
