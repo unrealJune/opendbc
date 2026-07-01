@@ -26,6 +26,7 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_STALE_S,
   BOSCH_RADAR_VREL_MAX,
   BOSCH_RADAR_BORN_CYCLES,
+  BOSCH_RADAR_SETTLE_CYCLES,
   BOSCH_RADAR_VALID_CAP,
   BOSCH_RADAR_TRACKID_STRIDE,
   BOSCH_RADAR_RANGE_MAX,
@@ -133,23 +134,29 @@ class TestCivicBoschFineParser(unittest.TestCase):
     # Drive one sweep: the given head/body frames PLUS the trigger terminator, so update() emits.
     return self._step(nanos, list(frames) + [self._trig(cntr)])
 
+  # A steady slot must clear TWO gates before it emits: S2 birth hysteresis (BORN_CYCLES valid sweeps) AND
+  # the settle gate (SETTLE_CYCLES consecutive clean KF cycles, which only start counting once the KF exists).
+  # So the first emit lands on cycle index BORN_CYCLES + SETTLE_CYCLES - 1; feed one extra for margin.
+  WARM_CYCLES = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES
+
   def _warm(self, range_raw, *, slot_addr=0x280, lat_raw=0x8000, base_ns=0, cntr0=0x10):
-    # S2 birth hysteresis: a slot must be a valid range-carrier for BOSCH_RADAR_BORN_CYCLES consecutive
-    # sweeps before it emits a point. Drive the slot (default 0x280) for BORN_CYCLES sweeps at a steady
-    # range so it is "born" on the returned sweep. Each sweep is terminated by the trigger (0x2DC) so the
-    # emit fires; CNTR advances each sweep to keep the S3 CNTR-stall fault from firing. Returns the last rr.
+    # Drive the slot (default 0x280) at a STEADY range for WARM_CYCLES sweeps so it is fully born AND settled
+    # -> emitting a point on the returned sweep. Each sweep is terminated by the trigger (0x2DC) so the emit
+    # fires; CNTR advances each sweep to keep the S3 CNTR-stall fault from firing. Returns the last rr.
+    # After this the slot has emitted, valid_cnt is saturated, and the next continuation sweep is index
+    # WARM_CYCLES (nanos = WARM_CYCLES*0.05s, cntr = cntr0 + WARM_CYCLES).
     dt_ns = int(0.05 * 1e9)
     rr = None
-    for k in range(BOSCH_RADAR_BORN_CYCLES):
+    for k in range(self.WARM_CYCLES):
       cntr = (cntr0 + k) & 0xFF
       body = [self._f(slot_addr, _hdr_frame(range_raw, lat_raw=lat_raw, cntr=cntr))]
       rr = self._emit(base_ns + k * dt_ns, body, cntr)
     return rr
 
   def test_single_live_track_emits_one_point(self):
-    # S2: a single sweep must NOT birth a point; two consecutive valid sweeps do.
-    self._emit(0, [self._f(0x280, _hdr_frame(3999, cntr=0x10))], 0x10)
-    rr = self._emit(int(0.05 * 1e9), [self._f(0x280, _hdr_frame(3999, cntr=0x11))], 0x11)
+    # A steady slot emits exactly one point once it is born (S2) AND settled. (A single-sweep glitch never
+    # births a point -- covered by test_s2_single_frame_glitch_no_phantom.)
+    rr = self._warm(3999)
     self.assertIsNotNone(rr)
     self.assertEqual(len(rr.points), 1)
     p = rr.points[0]
@@ -157,11 +164,11 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertEqual(p.trackId, 0 * BOSCH_RADAR_TRACKID_STRIDE + 1)
     self.assertEqual(p.trackId // BOSCH_RADAR_TRACKID_STRIDE, 0)  # still slot-decodable
     self.assertAlmostEqual(p.dRel, 0.00357 * 3999 - 3.0, places=4)
-    # S5: vRel is derived; on the birth cycle it derives from the prime cycle (steady range -> ~0), so the
-    # point is measured. vRel here is a real (near-zero) derived value, not NaN.
+    # S5: vRel is a real (near-zero) derived value for a steady lead -> measured. R1: once the KF is
+    # converged with a rate history it packs the smoothed aRel (no longer NaN); a steady lead -> ~0.
     self.assertTrue(p.measured)
-    self.assertTrue(math.isnan(p.aRel))
-    self.assertFalse(math.isnan(p.vRel))  # derived from the prime cycle (steady -> ~0)
+    self.assertFalse(math.isnan(p.vRel))
+    self.assertAlmostEqual(p.aRel, 0.0, delta=1.0)
 
   def test_b1_tag_gate_skips_nonheader(self):
     # b1 != 0x74 -> non-range sub-frame -> skipped (no point), even with a plausible range field.
@@ -190,8 +197,9 @@ class TestCivicBoschFineParser(unittest.TestCase):
       return self._emit(ns, [self._f(0x280, _hdr_frame(3000, cntr=cntr)),   # slot 0
                              self._f(0x284, _hdr_frame(4000, cntr=cntr)),   # slot 1
                              self._f(0x2D0, _hdr_frame(5000, cntr=cntr))], cntr)  # slot 2
-    burst(0, 0x10)                 # prime (S2 born hysteresis)
-    rr = burst(dt_ns, 0x11)        # born
+    rr = None
+    for k in range(self.WARM_CYCLES):   # born + settled -> all three emit
+      rr = burst(k * dt_ns, (0x10 + k) & 0xFF)
     self.assertEqual(len(rr.points), 3)
     # S1: trackId = slot*STRIDE + incarnation(=1); decode the slot back out to verify the 3 distinct slots.
     by_slot = {p.trackId // BOSCH_RADAR_TRACKID_STRIDE: p for p in rr.points}
@@ -214,15 +222,17 @@ class TestCivicBoschFineParser(unittest.TestCase):
 
   def test_vrel_derived_closing_negative(self):
     dt_ns = int(0.05 * 1e9)  # 50 ms
-    # cycle 0: first sight (valid_cnt 0->1, vRel NaN, no emit under S2 born hysteresis)
-    self._emit(0, [self._f(0x280, _hdr_frame(4000, cntr=0x10))], 0x10)
-    # cycle 1: range shrank -> closing; valid_cnt 1->2 -> point born this cycle with a derived vRel
-    rr = self._emit(dt_ns, [self._f(0x280, _hdr_frame(3000, cntr=0x11))], 0x11)
+    # Steady close: dRel shrinks a fixed amount each sweep -> the KF converges to that closing rate. Use a
+    # modest rate (< VREL_SOFT) so the base settle applies; warm past born+settle so the point emits.
+    step = 100  # raw/cycle -> 0.00357*100 = 0.357 m/cycle -> ~ -7.14 m/s
+    rate = -0.00357 * step / 0.05
+    rr = None
+    for k in range(self.WARM_CYCLES + 1):
+      rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(4000 - step * k, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
     p = rr.points[0]
     self.assertFalse(math.isnan(p.vRel))
     self.assertLess(p.vRel, 0.0)
-    expected = (0.00357 * 3000 - 0.00357 * 4000) / 0.05  # raw d(dRel)/dt (first derived sample, no EMA yet)
-    self.assertAlmostEqual(p.vRel, expected, delta=1.0)
+    self.assertAlmostEqual(p.vRel, rate, delta=1.5)  # KF converged to the steady closing rate
 
   def test_yrel_azimuth_formula_and_sign(self):
     # b4:b5 = AZIMUTH (rlog-settled 2026-06-08). yRel is the polar->cartesian projection:
@@ -267,31 +277,43 @@ class TestCivicBoschFineParser(unittest.TestCase):
   def _slots(self, rr):
     return {p.trackId // BOSCH_RADAR_TRACKID_STRIDE for p in rr.points}
 
+  def _warm2(self, dt_ns, cntr0=0x10):
+    # warm slots 0 and 1 together to emitting (born + settled). Returns (last_rr, next_cycle_index).
+    rr = None
+    for k in range(self.WARM_CYCLES):
+      c = (cntr0 + k) & 0xFF
+      rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(3000, cntr=c)),
+                                  self._f(0x284, _hdr_frame(4000, cntr=c))], c)
+    return rr, self.WARM_CYCLES
+
   def test_slot_clears_when_track_goes_sentinel(self):
     dt_ns = int(0.05 * 1e9)
-    # born: two valid sweeps for slots 0 and 1
-    self._emit(0, [self._f(0x280, _hdr_frame(3000, cntr=0x10)), self._f(0x284, _hdr_frame(4000, cntr=0x10))], 0x10)
-    rr = self._emit(dt_ns, [self._f(0x280, _hdr_frame(3000, cntr=0x11)), self._f(0x284, _hdr_frame(4000, cntr=0x11))], 0x11)
+    rr, k = self._warm2(dt_ns)
     self.assertEqual(self._slots(rr), {0, 1})
-    # slot 0 sentinel for TWO sweeps -> S2 persist tolerates the first, drops on the second.
-    rr = self._emit(2 * dt_ns, [self._f(0x280, _hdr_frame(3000, strength=0xFE, cntr=0x12)),
-                                self._f(0x284, _hdr_frame(4000, cntr=0x12))], 0x12)
-    self.assertEqual(self._slots(rr), {0, 1})  # slot 0 persists one cycle (valid_cnt 2->1)
-    rr = self._emit(3 * dt_ns, [self._f(0x280, _hdr_frame(3000, strength=0xFE, cntr=0x13)),
-                                self._f(0x284, _hdr_frame(4000, cntr=0x13))], 0x13)
-    self.assertEqual(self._slots(rr), {1})     # second sentinel cycle -> slot 0 dropped (valid_cnt -> 0)
+    # slot 0 goes sentinel; S2 persist tolerates it (valid_cnt saturated at VALID_CAP) then drops after
+    # VALID_CAP sustained sentinel cycles. slot 1 stays valid throughout.
+    c = (0x10 + k) & 0xFF
+    rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(3000, strength=0xFE, cntr=c)),
+                                self._f(0x284, _hdr_frame(4000, cntr=c))], c)
+    self.assertIn(0, self._slots(rr))          # one sentinel tolerated (persist hysteresis)
+    for j in range(1, BOSCH_RADAR_VALID_CAP + 1):
+      c = (0x10 + k + j) & 0xFF
+      rr = self._emit((k + j) * dt_ns, [self._f(0x280, _hdr_frame(3000, strength=0xFE, cntr=c)),
+                                        self._f(0x284, _hdr_frame(4000, cntr=c))], c)
+    self.assertEqual(self._slots(rr), {1})     # sustained sentinel -> slot 0 aged out, slot 1 retained
 
   def test_stale_track_aged_when_absent(self):
     dt_ns = int(0.05 * 1e9)
-    # born: two valid sweeps for slots 0 and 1
-    self._emit(0, [self._f(0x280, _hdr_frame(3000, cntr=0x10)), self._f(0x284, _hdr_frame(4000, cntr=0x10))], 0x10)
-    rr = self._emit(dt_ns, [self._f(0x280, _hdr_frame(3000, cntr=0x11)), self._f(0x284, _hdr_frame(4000, cntr=0x11))], 0x11)
+    rr, k = self._warm2(dt_ns)
     self.assertEqual(self._slots(rr), {0, 1})
-    # 0x284 absent for TWO trigger sweeps -> S2 persist tolerates one, ages out on the second.
-    rr = self._emit(2 * dt_ns, [self._f(0x280, _hdr_frame(3010, cntr=0x12))], 0x12)
-    self.assertEqual(self._slots(rr), {0, 1})  # slot 1 persists one absent cycle
-    rr = self._emit(3 * dt_ns, [self._f(0x280, _hdr_frame(3020, cntr=0x13))], 0x13)
-    self.assertEqual(self._slots(rr), {0})     # second absent cycle -> slot 1 aged out
+    # 0x284 (slot 1) goes absent; tolerated one cycle, then aged out after VALID_CAP sustained absences.
+    c = (0x10 + k) & 0xFF
+    rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(3010, cntr=c))], c)
+    self.assertIn(1, self._slots(rr))          # slot 1 persists one absent cycle
+    for j in range(1, BOSCH_RADAR_VALID_CAP + 1):
+      c = (0x10 + k + j) & 0xFF
+      rr = self._emit((k + j) * dt_ns, [self._f(0x280, _hdr_frame(3020 + j, cntr=c))], c)
+    self.assertEqual(self._slots(rr), {0})     # sustained absence -> slot 1 aged out
 
   def test_staleness_returns_empty_radardata_not_none(self):
     # trigger (0x2DC) born over two sweeps; then it goes quiet while another declared header keeps the
@@ -340,43 +362,46 @@ class TestCivicBoschFineParser(unittest.TestCase):
     # sample (vRel NaN) AND re-seed history so the NEXT cycle derives cleanly. S1: the post-swap point
     # must ALSO be published under a DIFFERENT trackId (no reuse across the swap, capnp:314).
     dt_ns = int(0.05 * 1e9)  # 50 ms
-    # Object A at ~11 m, then ~11.04 m (slow). Sweep 0 primes (S2), sweep 1 births with a small real vRel.
-    self._emit(0, [self._f(0x280, _hdr_frame(3900, cntr=0x10))], 0x10)
-    rr = self._emit(dt_ns, [self._f(0x280, _hdr_frame(3910, cntr=0x11))], 0x11)
-    self.assertFalse(math.isnan(rr.points[0].vRel))   # real small vRel
-    id_a = rr.points[0].trackId                        # object A's trackId (pre-swap)
-    # Sweep 2: a DIFFERENT object B jumps into slot 0 at ~110 m (raw ~31600). Implied speed is ~1900 m/s.
+    # Warm object A (~11 m) to an emitting point.
+    rrA = self._warm(3900)
+    id_a = rrA.points[0].trackId                       # object A's trackId (pre-swap)
+    k = self.WARM_CYCLES
+    # A DIFFERENT object B teleports into slot 0 at ~110 m (implied speed ~1900 m/s >> VREL_MAX) -> slot-reuse
+    # BREAK: incarnation bumped, KF reseeded, settle reset -> the teleport is WITHHELD (never published as a
+    # ~1900 m/s spike), rather than emitted with a NaN vRel.
     far_raw = int((110.0 + 3.0) / 0.00357)
-    rr = self._emit(2 * dt_ns, [self._f(0x280, _hdr_frame(far_raw, cntr=0x12))], 0x12)
+    rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(far_raw, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
+    self.assertEqual(len(rr.points), 0)                # phantom teleport suppressed this cycle
+    # Re-settle B at its new steady range -> it emits under a NEW trackId (no reuse) with an in-bounds vRel.
+    rr = None
+    for j in range(1, self.WARM_CYCLES + 1):
+      rr = self._emit((k + j) * dt_ns, [self._f(0x280, _hdr_frame(far_raw, cntr=(0x10 + k + j) & 0xFF))], (0x10 + k + j) & 0xFF)
     p = rr.points[0]
-    self.assertTrue(math.isnan(p.vRel))               # phantom rejected -> NaN, not ~1900 m/s
-    self.assertFalse(p.measured)                       # S5: NaN vRel -> estimate, not a measurement
-    self.assertAlmostEqual(p.dRel, 0.00357 * far_raw - 3.0, places=2)  # dRel still tracks the new object
-    id_b = p.trackId                                   # object B's trackId (post-swap)
-    # S1 core assertion: the swap produced a NEW trackId (no reuse). Both still decode to slot 0.
-    self.assertNotEqual(id_b, id_a)
+    id_b = p.trackId
+    self.assertNotEqual(id_b, id_a)                    # S1: no trackId reuse across the swap
     self.assertEqual(id_a // BOSCH_RADAR_TRACKID_STRIDE, 0)
     self.assertEqual(id_b // BOSCH_RADAR_TRACKID_STRIDE, 0)
-    # Sweep 3: object B advances slightly -> a real, in-bounds vRel now derives from the re-seeded baseline,
-    # and B keeps its (new) trackId across the clean sweep.
-    rr = self._emit(3 * dt_ns, [self._f(0x280, _hdr_frame(far_raw - 10, cntr=0x13))], 0x13)
-    p = rr.points[0]
+    self.assertAlmostEqual(p.dRel, 0.00357 * far_raw - 3.0, places=2)  # dRel tracks the new object
     self.assertFalse(math.isnan(p.vRel))
     self.assertLessEqual(abs(p.vRel), BOSCH_RADAR_VREL_MAX)
-    self.assertEqual(p.trackId, id_b)                  # stable id once the new object is continuous
 
   def test_in_bounds_fast_lead_keeps_stable_trackid(self):
-    # S1 control: a genuine fast closer (stationary object at highway speed ~31 m/s) must NOT be rejected
-    # AND must keep a STABLE trackId across sweeps (no spurious incarnation bump on a real, in-bounds vRel).
+    # S1 control: a genuine fast closer (stationary object at highway speed, ~ -28.6 m/s, in-bounds) must NOT
+    # be rejected and must keep a STABLE trackId. Under GRADUATED PERSISTENCE a high-|vRel| track must be
+    # tracked longer before it is trusted, so warm it well past SETTLE_HIGH, then verify a stable id + vRel.
     dt_ns = int(0.05 * 1e9)
-    self._emit(0, [self._f(0x280, _hdr_frame(int((50.0 + 3.0) / 0.00357), cntr=0x10))], 0x10)      # 50 m
-    rr = self._emit(dt_ns, [self._f(0x280, _hdr_frame(int((48.5 + 3.0) / 0.00357), cntr=0x11))], 0x11)  # ~-30 m/s
+    step = 400   # raw/cycle -> 0.00357*400/0.05 = ~ -28.6 m/s (below VREL_MAX/HARD_MAX)
+    raw0 = int((95.0 + 3.0) / 0.00357)
+    rr = None
+    n = 28       # comfortably past BORN + SETTLE_HIGH so a high-|vRel| track is trusted
+    for k in range(n):
+      rr = self._emit(k * dt_ns, [self._f(0x280, _hdr_frame(raw0 - step * k, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
     p = rr.points[0]
     id0 = p.trackId
     self.assertFalse(math.isnan(p.vRel))
     self.assertLess(p.vRel, 0.0)
     self.assertLessEqual(abs(p.vRel), BOSCH_RADAR_VREL_MAX)
-    rr = self._emit(2 * dt_ns, [self._f(0x280, _hdr_frame(int((47.0 + 3.0) / 0.00357), cntr=0x12))], 0x12)  # ~-30
+    rr = self._emit(n * dt_ns, [self._f(0x280, _hdr_frame(raw0 - step * n, cntr=(0x10 + n) & 0xFF))], (0x10 + n) & 0xFF)
     self.assertEqual(rr.points[0].trackId, id0)   # stable id for a continuous in-bounds fast lead
 
   def test_returns_radardata_with_points_list(self):
@@ -418,6 +443,17 @@ class TestCivicBoschFineSafeParity(unittest.TestCase):
   def _slots(self, rr):
     return {p.trackId // BOSCH_RADAR_TRACKID_STRIDE for p in rr.points}
 
+  # A steady slot emits only after BORN (S2) AND SETTLED (settle gate); drive it there.
+  WARM_CYCLES = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES
+
+  def _warm(self, range_raw, cntr0=0x10):
+    # Drive slot 0 at a steady range for WARM_CYCLES sweeps so it is born + settled -> emitting. Next
+    # continuation sweep is cycle index WARM_CYCLES (cntr cntr0 + WARM_CYCLES). Returns the last rr.
+    rr = None
+    for k in range(self.WARM_CYCLES):
+      rr = self._emit(k, [self._f(0x280, _hdr_frame(range_raw, cntr=(cntr0 + k) & 0xFF))], (cntr0 + k) & 0xFF)
+    return rr
+
   # ---- S2 birth/persist hysteresis -------------------------------------------------------------
   def test_s2_single_frame_glitch_no_phantom(self):
     # (a) a single 1-frame valid glitch must NOT birth a phantom point.
@@ -426,21 +462,24 @@ class TestCivicBoschFineSafeParity(unittest.TestCase):
     self.assertEqual(len(self.ri.pts), 0)
 
   def test_s2_born_after_n_cycles(self):
-    # birth requires exactly BOSCH_RADAR_BORN_CYCLES consecutive valid sweeps.
-    for k in range(BOSCH_RADAR_BORN_CYCLES - 1):
-      rr = self._emit(k, [self._f(0x280, _hdr_frame(3000, cntr=0x10 + k))], 0x10 + k)
-      self.assertEqual(len(rr.points), 0)
-    rr = self._emit(BOSCH_RADAR_BORN_CYCLES - 1,
-                    [self._f(0x280, _hdr_frame(3000, cntr=0x10 + BOSCH_RADAR_BORN_CYCLES - 1))],
-                    0x10 + BOSCH_RADAR_BORN_CYCLES - 1)
-    self.assertEqual(len(rr.points), 1)
+    # A point is published only after the slot is BORN (BORN_CYCLES valid sweeps) AND SETTLED (SETTLE_CYCLES
+    # clean KF cycles). No point appears before both are met; for a steady slot the settle gate binds, so the
+    # first emit lands no earlier than SETTLE_CYCLES.
+    first = None
+    for k in range(self.WARM_CYCLES):
+      rr = self._emit(k, [self._f(0x280, _hdr_frame(3000, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
+      if rr.points and first is None:
+        first = k
+    self.assertIsNotNone(first)                 # it does emit within born+settle sweeps
+    self.assertGreaterEqual(first, BOSCH_RADAR_SETTLE_CYCLES)
+    self.assertGreaterEqual(first, BOSCH_RADAR_BORN_CYCLES - 1)
 
   def test_s2_single_miss_does_not_drop(self):
-    # (b) one missed cycle must NOT drop an established point (persist tolerance).
-    self._emit(0, [self._f(0x280, _hdr_frame(3000, cntr=0x10))], 0x10)
-    self._emit(1, [self._f(0x280, _hdr_frame(3000, cntr=0x11))], 0x11)  # born
-    rr = self._emit(2, [self._f(0x280, _hdr_frame(0x8000, cntr=0x12))], 0x12)  # slot-0 sentinel (1 miss)
-    self.assertEqual(self._slots(rr), {0})      # retained for one missed cycle
+    # (b) one missed cycle must NOT drop an established (born+settled) point (persist tolerance).
+    self._warm(3000)
+    k = self.WARM_CYCLES
+    rr = self._emit(k, [self._f(0x280, _hdr_frame(0x8000, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
+    self.assertEqual(self._slots(rr), {0})      # retained for one missed cycle (valid_cnt decremented, >0)
 
   def test_s2_two_misses_drop(self):
     # (c) two consecutive missed cycles DO drop the point.
@@ -495,44 +534,48 @@ class TestCivicBoschFineSafeParity(unittest.TestCase):
 
   # ---- S5 honest measured flag ----------------------------------------------------------------
   def test_s5_estimate_vs_measurement(self):
-    # A point whose vRel is still NaN (re-seed/first-sight) is an ESTIMATE (measured=False); once a stable
-    # derived vRel exists the point is a MEASUREMENT (measured=True).
-    self._emit(0, [self._f(0x280, _hdr_frame(4000, cntr=0x10))], 0x10)            # prime
-    rr = self._emit(1, [self._f(0x280, _hdr_frame(3900, cntr=0x11))], 0x11)       # born, derived vRel
+    # A settled track publishes a MEASUREMENT (measured=True, real derived vRel). A destabilising event (a
+    # slot-reuse teleport) reseeds the slot and RESETS settle -> the point is WITHHELD (not published as a
+    # NaN estimate) until it re-settles; then it is a measurement again.
+    rr = self._warm(4000)
     self.assertFalse(math.isnan(rr.points[0].vRel))
     self.assertTrue(rr.points[0].measured)
-    # Force a re-seed via a discontinuity -> vRel NaN this cycle -> measured False.
-    far = int((120.0 + 3.0) / 0.00357)
-    rr = self._emit(2, [self._f(0x280, _hdr_frame(far, cntr=0x12))], 0x12)
-    self.assertTrue(math.isnan(rr.points[0].vRel))
-    self.assertFalse(rr.points[0].measured)
+    k = self.WARM_CYCLES
+    far = int((120.0 + 3.0) / 0.00357)                          # teleport -> BREAK -> settle reset
+    rr = self._emit(k, [self._f(0x280, _hdr_frame(far, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
+    self.assertEqual(len(rr.points), 0)                         # withheld while unsettled (no NaN published)
+    rr = None
+    for j in range(1, self.WARM_CYCLES + 1):
+      rr = self._emit(k + j, [self._f(0x280, _hdr_frame(far, cntr=(0x10 + k + j) & 0xFF))], (0x10 + k + j) & 0xFF)
+    self.assertTrue(rr.points[0].measured)                      # re-settled -> measurement again
 
   # ---- S6 vRel derivation hardening -----------------------------------------------------------
   def test_s6_long_gap_reseeds_no_spike(self):
-    # A long gap (> DT_MAX) between two sightings must RE-SEED (vRel NaN this cycle), not derive a spike
-    # from two far-apart-in-time samples. Use a big dRel change over a > DT_MAX gap.
-    self._emit(0, [self._f(0x280, _hdr_frame(4000, cntr=0x10))], 0x10)
-    self._emit(1, [self._f(0x280, _hdr_frame(3950, cntr=0x11))], 0x11)  # born, small real vRel
-    # next sweep arrives after a > DT_MAX gap with a large dRel change
+    # A long gap (> DT_MAX) between sightings must RE-SEED (not derive a spike from two far-apart samples).
+    # The re-seed resets settle, so no point is published on the gap cycle; after re-settling, the vRel is a
+    # clean in-bounds value -- never a spike.
+    rr = self._warm(4000)
+    self.assertIsNotNone(rr.points[0])
+    k = self.WARM_CYCLES
     gap_k = int((BOSCH_RADAR_VREL_DT_MAX_S + 0.2) / 0.05) + 1
-    rr = self._emit(1 + gap_k, [self._f(0x280, _hdr_frame(2000, cntr=0x12))], 0x12)
-    self.assertTrue(math.isnan(rr.points[0].vRel))   # re-seeded, not a spike
-    # the cycle AFTER re-seed derives a clean, in-bounds vRel from the new baseline
-    rr = self._emit(2 + gap_k, [self._f(0x280, _hdr_frame(1990, cntr=0x13))], 0x13)
+    rr = self._emit(k + gap_k, [self._f(0x280, _hdr_frame(2000, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
+    self.assertEqual(len(rr.points), 0)                         # re-seeded + unsettled -> withheld, no spike
+    rr = None
+    for j in range(1, self.WARM_CYCLES + 1):
+      rr = self._emit(k + gap_k + j, [self._f(0x280, _hdr_frame(2000, cntr=(0x10 + k + j) & 0xFF))], (0x10 + k + j) & 0xFF)
     self.assertFalse(math.isnan(rr.points[0].vRel))
     self.assertLessEqual(abs(rr.points[0].vRel), BOSCH_RADAR_VREL_MAX)
 
   def test_s6_smooth_close_stable_negative_vrel(self):
-    # A smooth closing sequence yields a stable negative derived vRel (EMA applied, in-bounds).
+    # A smooth closing sequence yields a stable negative derived vRel (in-bounds). Points appear only once
+    # settled; collect the emitted ones over a long steady close.
     rng = 4000
-    self._emit(0, [self._f(0x280, _hdr_frame(rng, cntr=0x10))], 0x10)  # prime
     vrels = []
-    for k in range(1, 8):
-      rng -= 50  # steady close
+    for k in range(self.WARM_CYCLES + 6):
+      rng -= 50  # steady close (~ -3.6 m/s, base settle band)
       rr = self._emit(k, [self._f(0x280, _hdr_frame(rng, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
-      v = rr.points[0].vRel
-      if not math.isnan(v):
-        vrels.append(v)
+      if rr.points and not math.isnan(rr.points[0].vRel):
+        vrels.append(rr.points[0].vRel)
     self.assertGreater(len(vrels), 3)
     self.assertTrue(all(v < 0.0 for v in vrels))                 # all closing
     self.assertTrue(all(abs(v) <= BOSCH_RADAR_VREL_MAX for v in vrels))

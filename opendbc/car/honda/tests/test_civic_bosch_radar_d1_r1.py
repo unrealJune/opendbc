@@ -16,9 +16,13 @@ from opendbc.car.honda.radar_interface import (
   RadarInterface,
   BOSCH_RADAR_HDR_TAG,
   BOSCH_RADAR_BORN_CYCLES,
+  BOSCH_RADAR_SETTLE_CYCLES,
   BOSCH_RADAR_VREL_DT_MAX_S,
   BOSCH_RADAR_VREL_MAX,
 )
+
+# A steady slot emits only after it is born (S2) AND settled (settle gate).
+WARM_CYCLES = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES
 from opendbc.car.honda.values import CAR
 
 RANGE_SCALE = 0.00357  # m/LSB (DBC)
@@ -84,9 +88,9 @@ class BoschCase(unittest.TestCase):
 
 class TestD1TagDemux(BoschCase):
   def test_meta_after_range_no_longer_clears_live_track(self):
-    # warm to born with clean sweeps
-    self._close_sequence(40.0, 0.0, BOSCH_RADAR_BORN_CYCLES)
-    base = BOSCH_RADAR_BORN_CYCLES * SWEEP_NS
+    # warm to born + settled with clean sweeps
+    self._close_sequence(40.0, 0.0, WARM_CYCLES)
+    base = WARM_CYCLES * SWEEP_NS
     # same window: 0x74 range frame FIRST, meta frame AFTER (old vl read saw only the meta -> mis-clear)
     rr = self.ri.update(_can(base, [
       self._f(0x280, _hdr_frame(_raw_for(40.0), cntr=0x20)),
@@ -111,9 +115,10 @@ class TestD1TagDemux(BoschCase):
 
   def test_multi_batch_harvest_across_update_calls(self):
     # frames arrive in SEPARATE rcp.update batches within one trigger window (the on-device shape:
-    # vl_all is wiped per batch; the harvest must have captured the early frame)
-    self._close_sequence(40.0, 0.0, BOSCH_RADAR_BORN_CYCLES)
-    base = BOSCH_RADAR_BORN_CYCLES * SWEEP_NS
+    # vl_all is wiped per batch; the harvest must have captured the early frame). Warm at the SAME range
+    # the final window uses so the settle gate stays satisfied (no step -> no adaptive reset).
+    self._close_sequence(39.5, 0.0, WARM_CYCLES)
+    base = WARM_CYCLES * SWEEP_NS
     r = self.ri.update(_can(base, [self._f(0x280, _hdr_frame(_raw_for(39.5), cntr=0x40))]))
     self.assertIsNone(r)  # no trigger yet -> no emit
     rr = self.ri.update(_can(base + int(8e6), [self._f(0x280, _meta_frame(cntr=0x40)), self._trig(0x40)]))

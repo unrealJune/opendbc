@@ -85,23 +85,23 @@ BO_ 732 RADAR_TRACK_5: 8 RADAR
 
 
 BO_ 712 RADAR_SELECTED_0: 8 RADAR
- SG_ LONG_DIST : 7|16@0+ (1,0) [0|65535] "m" XXX
- SG_ LONG_DIST_HI : 7|8@0+ (1,0) [0|255] "" XXX
- SG_ LAT_DIST : 39|16@0+ (1,-32768) [-32768|32767] "m" XXX
- SG_ REL_SPEED : 55|8@0+ (0.25,-31.25) [-31.25|32.5] "m/s" XXX
- SG_ CNTR : 63|4@0+ (1,0) [0|15] "" XXX
- SG_ CHKSUM : 59|4@0+ (1,0) [0|15] "" XXX
+ SG_ SEL_STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
+ SG_ SEL_CNTR_LO : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ SEL_RANGE : 23|16@0+ (1,0) [0|65535] "" XXX
+ SG_ SEL_LAT : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
+ SG_ REL_SPEED : 55|8@0+ (-0.7,86.5) [-92|87] "m/s" XXX
+ SG_ SEL_CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
 BO_ 713 RADAR_SELECTED_1: 8 RADAR
- SG_ LONG_DIST : 7|16@0+ (1,0) [0|65535] "m" XXX
- SG_ LONG_DIST_HI : 7|8@0+ (1,0) [0|255] "" XXX
- SG_ LAT_DIST : 39|16@0+ (1,-32768) [-32768|32767] "m" XXX
- SG_ REL_SPEED : 55|8@0+ (0.25,-31.25) [-31.25|32.5] "m/s" XXX
- SG_ CNTR : 63|4@0+ (1,0) [0|15] "" XXX
- SG_ CHKSUM : 59|4@0+ (1,0) [0|15] "" XXX
+ SG_ SEL_STRENGTH : 7|8@0+ (1,0) [0|255] "" XXX
+ SG_ SEL_CNTR_LO : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ SEL_RANGE : 23|16@0+ (1,0) [0|65535] "" XXX
+ SG_ SEL_LAT : 39|16@0+ (1,-32768) [-32768|32767] "" XXX
+ SG_ REL_SPEED : 55|8@0+ (-0.7,86.5) [-92|87] "m/s" XXX
+ SG_ SEL_CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
 
-CM_ "Stock 36802-TBA Bosch radar FINE per-track object table. Big-endian (Motorola), all frames DLC8. The radar broadcasts 6 track records, each a 4-frame burst on consecutive IDs; only the HEADER ID of each record (0x280/0x284/0x2D0/0x2D4/0x2D8/0x2DC) carries RANGE, and only on the sub-frame where B1==0x74 (the range-carrier header tag). The other 3 sub-frames of each record (0x281-0x283, 0x285-0x287, 0x2D1-0x2D3, ...) carry lateral/velocity/status and would decode to spurious sub-zero range -- they are deliberately NOT declared, so the parser never reads them as range. The parser GATES on TRACK_TAG(B1)==0x74. Sentinels (any one -> not an active track): STRENGTH(B0)==0xFE (idle), RANGE_RAW(B2:B3)==0x8000 (~114m unset), RANGE_RAW>=0xFF80 (~230m saturation rail). RANGE and RANGE_RAW intentionally overlap B2:B3 (scaled meters vs raw int for the sentinel test) -- opendbc decodes overlapping signals independently, exactly like the coarse LONG_DIST/LONG_DIST_HI overlap. RANGE scale/offset (0.00357, -3.0) is cross-car-validated; the offset -3.0 is tape-anchored. LAT_RAW is offset-binary (raw 0x8000 = center, declared with offset -32768); its physical m/LSB is NOT pinned, so the parser applies a clearly-placeholdered LAT_SCALE and yRel magnitude is DO_NOT_TRUST until a controlled lateral cal. vRel is NOT published by the radar on these frames; the parser derives it as d(dRel)/dt per track. 0x2C8/0x2C9 remain declared as a dormant coarse reference and are NOT read by the fine parser.";
+CM_ "Stock 36802-TBA Bosch radar FINE per-track object table. Big-endian (Motorola), all frames DLC8. The radar broadcasts 6 track records, each a 4-frame burst on consecutive IDs; only the HEADER ID of each record (0x280/0x284/0x2D0/0x2D4/0x2D8/0x2DC) carries RANGE, and only on the sub-frame where B1==0x74 (the range-carrier header tag). The other 3 sub-frames of each record (0x281-0x283, 0x285-0x287, 0x2D1-0x2D3, ...) carry lateral/velocity/status and would decode to spurious sub-zero range -- they are deliberately NOT declared, so the parser never reads them as range. The parser GATES on TRACK_TAG(B1)==0x74. Sentinels (any one -> not an active track): STRENGTH(B0)==0xFE (idle), RANGE_RAW(B2:B3)==0x8000 (~114m unset), RANGE_RAW>=0xFF80 (~230m saturation rail). RANGE and RANGE_RAW intentionally overlap B2:B3 (scaled meters vs raw int for the sentinel test) -- opendbc decodes overlapping signals independently. RANGE scale/offset (0.00357, -3.0) is cross-car-validated; the offset -3.0 is tape-anchored. LAT_RAW is offset-binary (raw 0x8000 = center, declared with offset -32768); its physical m/LSB is NOT pinned, so the parser applies a clearly-placeholdered LAT_SCALE and yRel magnitude is DO_NOT_TRUST until a controlled lateral cal. vRel is NOT published by the radar on the FINE 0x280 frames; the parser derives it as d(dRel)/dt per track. 0x2C8/0x2C9 (RADAR_SELECTED) remain declared as a coarse, RX-only reference and are NOT read by the fine parser; their byte layout was RE-DERIVED 2026-06-30 against the clean vision lead (see BO_ 712 comment) -- the prior LONG_DIST@B0:B1 / REL_SPEED@(0.25,-31.25) layout was WRONG. REL_SPEED is the byte-6 coarse relative velocity, now CALIBRATED (vRel = -0.7*(B6-124) m/s, r=0.90 vs vision).";
 CM_ BO_ 640 "Track slot 0 header (record 0x280-0x283). Range carrier when TRACK_TAG(B1)==0x74. Head of the 6-slot sweep burst.";
 CM_ BO_ 644 "Track slot 1 header (record 0x284-0x287).";
 CM_ BO_ 720 "Track slot 2 header (record 0x2D0-0x2D3).";
@@ -114,4 +114,8 @@ CM_ SG_ 640 RANGE "B2:B3 BE16 -> meters. range = 0.00357*raw - 3.0. Scale cross-
 CM_ SG_ 640 RANGE_RAW "B2:B3 BE16 raw (factor 1). Overlaps RANGE; used for the scale-invariant sentinel tests (==0x8000 unset, >=0xFF80 saturation).";
 CM_ SG_ 640 LAT_RAW "B4:B5 BE offset-binary, raw 0x8000=center encoded as offset -32768. FIELD IDENTITY = AZIMUTH ANGLE (LSB = deg), settled 2026-06-08 by a three-source rlog regression vs the vision-model lead (~20.9k matched frames; azimuth wins every discriminating segment, range-rate falsified) -- NOT range-rate, NOT lateral-metres. The parser computes the lateral projection trigonometrically: yRel = -dRel*sin((b4b5-0x8000)*LAT_SCALE_DEG_PER_LSB*pi/180), left-positive. LAT_RAW stays a RAW signal here (= b4b5-0x8000); the angle->cartesian math lives in radar_interface.py. Scale ~0.001 deg/LSB (rlog band 0.0007-0.001; 0.001462 REJECTED). Absolute boresight zero-offset still unpinned (per-mount bias).";
 CM_ SG_ 640 CNTR "B7 rolling counter. Decoded but UNUSED by openpilot and NOT safety-enforced (named CNTR, not COUNTER, to avoid opendbc's honda_* auto-enforcement that would drop frames).";
-CM_ SG_ 712 LONG_DIST "DORMANT coarse reference (0x2C8). NOT read by the fine parser; range is taken from the 0x280 block. Kept for diff/reference only.";
+CM_ BO_ 712 "RADAR_SELECTED_0 (0x2C8): the radar's single SELECTED-lead coarse output. RX-only reference, NOT read by the fine parser (range/lateral come from the 0x280 block). Layout RE-DERIVED 2026-06-30 by binning raw bytes against the clean vision lead (modelV2.leadsV3[0] range + v - carState.vEgo); the prior DBC layout (LONG_DIST@B0:B1 scale 1, REL_SPEED@0.25,-31.25) was UNVALIDATED guesswork and is now known WRONG. Findings: B0(SEL_STRENGTH)=return strength / inverse-range (108 near <5m -> 55 far >70m); B1/B7=rolling counters; B2:B3(SEL_RANGE)=coarse range proxy, raw, scale unvalidated; B4:B5(SEL_LAT)=offset-binary lateral (~center => lead dead-ahead); B6(REL_SPEED)=coarse relative velocity, see SG comment. Most data was vRel in [-1,1] (stop-and-go) so scales are not pinned -- needs a high-Delta-v capture.";
+CM_ SG_ 712 REL_SPEED "B6 native relative velocity (Doppler) for the SELECTED lead. CALIBRATED 2026-07-01 against the clean vision lead on two high-Delta-v highway segments (route 00000007--66c6f132c5 seg 6 & 22, single clear lead): vRel = -0.7*B6 + 86.5 m/s (zero at B6~124), r=0.90, RMS 1.32 m/s over vRel -6..+9 m/s. 8-bit only (B6; 16-bit combos add no info) so resolution ~0.7 m/s/LSB (coarse). SIGN: B6 rises as the lead closes. Scale +/-10% (seg fits -0.68..-0.76) and validated only to ~+/-9 m/s so far. The legacy 0.25,-31.25 was WRONG. This is a REAL published Doppler (no derivation lag) but SELECTED-lead only -- candidate to fuse as the primary-lead vRel alongside the fine 0x280 KF-derived per-track vRel.";
+CM_ SG_ 712 SEL_RANGE "B2:B3 BE16 raw. Coarse range proxy (rises with distance); scale unvalidated and nonlinear at close range. The FINE 0x280 block is the calibrated range source -- this is reference only.";
+CM_ SG_ 712 SEL_LAT "B4:B5 BE offset-binary (raw 0x8000=center, offset -32768). Lateral position of the selected lead; ~center in this corpus (lead dead-ahead). Scale unvalidated.";
+CM_ SG_ 712 SEL_STRENGTH "B0 return strength / inverse-range proxy (108 near -> 55 far). Not a distance in meters.";

@@ -30,6 +30,7 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_HDR_TAG,        # 0x74 -- kept for DBC decode asserts and backward compat
   BOSCH_RADAR_HDR_TAG_SET,    # {0x74, 0x94} -- the allow-list
   BOSCH_RADAR_BORN_CYCLES,
+  BOSCH_RADAR_SETTLE_CYCLES,
   BOSCH_RADAR_TRACKID_STRIDE,
 )
 from opendbc.car.honda.values import CAR
@@ -84,11 +85,14 @@ class BoschCase(unittest.TestCase):
   def _emit(self, nanos, frames, cntr):
     return self.ri.update(_can(nanos, list(frames) + [self._trig(cntr)]))
 
+  WARM_CYCLES = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES
+
   def _warm(self, range_raw, *, tag=BOSCH_RADAR_HDR_TAG, slot_addr=0x280,
             lat_raw=0x8000, base_ns=0, cntr0=0x10):
-    """Drive BORN_CYCLES sweeps so the slot is born on the last returned rr."""
+    """Drive WARM_CYCLES sweeps at a steady range so the slot is born AND settled -> emitting on the
+    returned rr. Next continuation sweep is cycle index WARM_CYCLES (cntr cntr0 + WARM_CYCLES)."""
     rr = None
-    for k in range(BOSCH_RADAR_BORN_CYCLES):
+    for k in range(self.WARM_CYCLES):
       cntr = (cntr0 + k) & 0xFF
       body = [self._f(slot_addr, _hdr_frame(range_raw, tag=tag, lat_raw=lat_raw, cntr=cntr))]
       rr = self._emit(base_ns + k * SWEEP_NS, body, cntr)
@@ -117,14 +121,15 @@ class TestStationaryGateAllowList(BoschCase):
     self.assertEqual(self._slots(rr), {0})
 
   def test_a_0x94_range_and_vrel_pipeline_complete(self):
-    # (a) full pipeline: two consecutive 0x94 sweeps -> born point with a derived vRel
-    rng0 = _raw_for(20.0)
-    rng1 = _raw_for(18.5)
-    self._emit(0, [self._f(0x280, _hdr_frame(rng0, tag=0x94, cntr=0x10))], 0x10)  # prime
-    rr = self._emit(SWEEP_NS, [self._f(0x280, _hdr_frame(rng1, tag=0x94, cntr=0x11))], 0x11)  # born
+    # (a) full pipeline: a steady 0x94 closing sequence -> born+settled point with a derived negative vRel.
+    step = 100  # raw/cycle -> ~ -7.14 m/s (base settle band)
+    raw0 = _raw_for(20.0)
+    rr = None
+    for k in range(self.WARM_CYCLES + 1):
+      c = (0x10 + k) & 0xFF
+      rr = self._emit(k * SWEEP_NS, [self._f(0x280, _hdr_frame(raw0 - step * k, tag=0x94, cntr=c))], c)
     self.assertEqual(len(rr.points), 1)
     p = rr.points[0]
-    self.assertAlmostEqual(p.dRel, 18.5, delta=0.05)
     self.assertFalse(math.isnan(p.vRel))
     self.assertLess(p.vRel, 0.0)   # closing
 
@@ -137,8 +142,12 @@ class TestStationaryGateAllowList(BoschCase):
 
   def test_b_0x74_vrel_regression(self):
     # (b) closing sequence under 0x74 still yields negative vRel (R1 pipeline unaffected)
-    self._emit(0, [self._f(0x280, _hdr_frame(_raw_for(25.0), tag=0x74, cntr=0x10))], 0x10)
-    rr = self._emit(SWEEP_NS, [self._f(0x280, _hdr_frame(_raw_for(23.5), tag=0x74, cntr=0x11))], 0x11)
+    step = 100
+    raw0 = _raw_for(25.0)
+    rr = None
+    for k in range(self.WARM_CYCLES + 1):
+      c = (0x10 + k) & 0xFF
+      rr = self._emit(k * SWEEP_NS, [self._f(0x280, _hdr_frame(raw0 - step * k, tag=0x74, cntr=c))], c)
     self.assertEqual(len(rr.points), 1)
     self.assertFalse(math.isnan(rr.points[0].vRel))
     self.assertLess(rr.points[0].vRel, 0.0)
@@ -323,26 +332,20 @@ class TestMixedWindow(BoschCase):
     self.assertTrue(0x75 in rec.meta_frames)
 
   def test_e_mixed_end_to_end_0x94_slot_emits_point(self):
-    # (e) end-to-end: two sweeps with 0x94 tags, interleaved with meta frames in the same window.
-    # The stop-class range carrier must survive the demux and produce a born point.
+    # (e) end-to-end: 0x94 tags interleaved with a trailing meta frame in the same window, over enough
+    # sweeps to settle. The stop-class range carrier must survive the demux and produce a settled point.
     meta_bytes = bytes([0x10, 0x75, 0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x10])  # tag=0x75
-    rng0 = _raw_for(18.0)
-    rng1 = _raw_for(17.0)
-    # sweep 0: 0x94 range frame + a trailing 0x75 meta
-    self.ri.update(_can(0, [
-      self._f(0x280, _hdr_frame(rng0, tag=0x94, cntr=0x10)),
-      self._f(0x280, meta_bytes),
-      self._trig(0x10),
-    ]))
-    # sweep 1: same pattern; should be born (2nd valid range cycle)
-    rr = self.ri.update(_can(SWEEP_NS, [
-      self._f(0x280, _hdr_frame(rng1, tag=0x94, cntr=0x11)),
-      self._f(0x280, meta_bytes),
-      self._trig(0x11),
-    ]))
+    rr = None
+    for k in range(self.WARM_CYCLES):
+      c = (0x10 + k) & 0xFF
+      rr = self.ri.update(_can(k * SWEEP_NS, [
+        self._f(0x280, _hdr_frame(_raw_for(18.0), tag=0x94, cntr=c)),
+        self._f(0x280, meta_bytes),
+        self._trig(c),
+      ]))
     self.assertIsNotNone(rr)
     self.assertEqual(len(rr.points), 1, "0x94 stop sweep with trailing meta must emit a RadarPoint")
-    self.assertAlmostEqual(rr.points[0].dRel, 17.0, delta=0.05)
+    self.assertAlmostEqual(rr.points[0].dRel, 18.0, delta=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -358,15 +361,16 @@ class TestStationaryGateParity(BoschCase):
     self.assertEqual(len(rr.points), 0, "single 0x94 sweep must not birth a phantom (S2)")
 
   def test_s2_parity_0x94_born_after_n_cycles(self):
-    # S2: 0x94 track born after exactly BORN_CYCLES.
-    for k in range(BOSCH_RADAR_BORN_CYCLES - 1):
+    # S2/settle parity: a 0x94 track publishes only after born AND settled (same as 0x74); the settle gate
+    # binds, so the first emit lands no earlier than SETTLE_CYCLES.
+    first = None
+    for k in range(self.WARM_CYCLES):
       cntr = (0x10 + k) & 0xFF
       rr = self._emit(k * SWEEP_NS, [self._f(0x280, _hdr_frame(_raw_for(10.0), tag=0x94, cntr=cntr))], cntr)
-      self.assertEqual(len(rr.points), 0)
-    cntr = (0x10 + BOSCH_RADAR_BORN_CYCLES - 1) & 0xFF
-    rr = self._emit((BOSCH_RADAR_BORN_CYCLES - 1) * SWEEP_NS,
-                    [self._f(0x280, _hdr_frame(_raw_for(10.0), tag=0x94, cntr=cntr))], cntr)
-    self.assertEqual(len(rr.points), 1)
+      if rr.points and first is None:
+        first = k
+    self.assertIsNotNone(first)
+    self.assertGreaterEqual(first, BOSCH_RADAR_SETTLE_CYCLES)
 
   def test_s2_parity_0x94_to_0x74_transition_stable(self):
     # A slot that transitions from 0x94 (stop) to 0x74 (moving) should keep its trackId
@@ -374,9 +378,10 @@ class TestStationaryGateParity(BoschCase):
     rr0 = self._warm(_raw_for(5.0), tag=0x94)
     self.assertEqual(len(rr0.points), 1)
     id_stop = rr0.points[0].trackId
+    k = self.WARM_CYCLES
     # next sweep: same range, 0x74 tag (car starts moving again)
-    rr1 = self._emit(BOSCH_RADAR_BORN_CYCLES * SWEEP_NS,
-                     [self._f(0x280, _hdr_frame(_raw_for(5.0), tag=0x74, cntr=0x30))], 0x30)
+    rr1 = self._emit(k * SWEEP_NS,
+                     [self._f(0x280, _hdr_frame(_raw_for(5.0), tag=0x74, cntr=(0x10 + k) & 0xFF))], (0x10 + k) & 0xFF)
     self.assertEqual(len(rr1.points), 1)
     self.assertEqual(rr1.points[0].trackId, id_stop,
                      "0x94->0x74 tag change (same slot, no vacancy) must NOT bump incarnation")

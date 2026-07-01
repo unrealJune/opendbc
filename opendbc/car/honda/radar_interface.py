@@ -85,7 +85,42 @@ BOSCH_RADAR_STALE_S = 0.15  # ~3 missed 20 Hz frames
 # from the new object instead of carrying a phantom. The bound is deliberately generous: a genuine
 # fast-closing lead (stationary object at highway speed ~31 m/s, or a head-on ~60 m/s) is far below it,
 # so no real lead is ever rejected; only the swap artifact (which is ~20x over) is.
-BOSCH_RADAR_VREL_MAX = 100.0  # m/s; |derived vRel| above this == slot-reuse artifact, not a real speed
+#
+# PHANTOM-BRAKE FIX (nrdrbranchdebug, route 0543acc22b): the original 100 m/s bound was FAR too loose --
+# replay of the bookmarked drive showed the 0x280 decode emitting |vRel| up to 89.6 m/s and feeding
+# radard 303 fused leads whose closing speed disagreed with the vision model by >4 m/s (118 of them with
+# the radar inventing a hard-closing lead that vision did not see), the direct cause of the phantom
+# braking. A genuine fast-closing lead for this Honda use case is a stationary object at highway speed
+# (~31 m/s) or a hard head-on (~40 m/s); anything implying a faster instantaneous jump is a decode/swap
+# artifact, so 30 m/s is the tighter slot-reuse BREAK bound (was 100).
+BOSCH_RADAR_VREL_MAX = 30.0  # m/s; implied per-frame |jump speed| above this == swap artifact -> BREAK
+
+# Emit-time vRel trust gate -- GRADUATED PERSISTENCE (replaces the old flat |vRel| cap, 2026-07-01).
+# A flat magnitude cap (formerly PLAUSIBLE=20/30) is the wrong tool: it cannot tell a REAL fast closer from
+# a phantom. A stopped car at highway speed closes at |vRel| up to ~30, so a low cap BLINDS us to distant
+# stopped traffic (car doesn't slow), while a high cap lets phantoms through (phantom braking). Instead:
+# the HIGHER the claimed |vRel|, the LONGER the track must have been cleanly tracked (settle cycles) before
+# we trust it. A real fast closer persists as you approach and EARNS the trust; a short-lived phantom never
+# accumulates it. (KF range-rate variance p11 was tested as the discriminator and REJECTED -- it converges
+# to ~0.92 for every track regardless of quality; persistence is what actually separates real from phantom.)
+# A hard physical ceiling still drops decode garbage outright.
+# Validated on drive 00000007 highway seg 6/13/14/22 (n=5492): residual |vRel|>15 drops 101->~10, >20 -> 0,
+# lead-retention preserved (~62%), and ZERO persistent (settle>=20) high-vRel tracks dropped -> a real
+# stopped car is KEPT, unlike the flat cap. High-|vRel| detection is delayed by the settle requirement
+# (~0.5-0.9 s) -- an accepted tradeoff; the PRIMARY distant-stopped-traffic fix is the azimuth/yRel
+# calibration (far tracks are currently mis-placed laterally -> not fused by radard), see CAPTURE_SPEC.
+BOSCH_RADAR_VREL_HARD_MAX = 45.0   # m/s; above this is not a real closing speed for this car -> always drop
+BOSCH_RADAR_VREL_SOFT = 15.0       # m/s; |vRel| <= this is trusted at the base SETTLE_CYCLES
+BOSCH_RADAR_VREL_MID = 25.0        # m/s; (SOFT, MID] must survive SETTLE_MID clean cycles
+BOSCH_RADAR_SETTLE_MID = 10        # clean cycles required to trust |vRel| in (SOFT, MID]
+BOSCH_RADAR_SETTLE_HIGH = 18       # clean cycles required to trust |vRel| in (MID, HARD_MAX]
+
+# Settle gate: a slot must produce this many CONSECUTIVE clean KF updates (no birth, no reseed, no BREAK,
+# and no innovation-adaptive/maneuver step) before its vRel is trusted enough to emit a point. Jumpy /
+# churning tracks -- the source of the swinging +5/-23 m/s phantom closings -- never accumulate a clean
+# run, so they are suppressed (radard uses vision); a real, smoothly-tracked lead settles in ~0.15 s and
+# emits continuously. SETTLE_CYCLES > KF_CONV_UPDATES so vRel is always converged by the time it emits.
+BOSCH_RADAR_SETTLE_CYCLES = 3
 
 # --- SAFE parity hardening constants (PARITY-MATRIX §3/§4; RX-only, keep-AEB preserved) ----------
 # S1 -- trackId no-reuse (capnp car.capnp:314 "no trackId reuse"). trackId is no longer the bare slot
@@ -170,7 +205,7 @@ class _SlotRangeKF:
   implied jump speed > VREL_MAX -> caller-visible BREAK (S1 incarnation bump). range_rate is
   published only after CONV_UPDATES measurements (S5: estimate vs measurement honesty).
   """
-  __slots__ = ("r", "v", "a", "p00", "p01", "p11", "t", "n")
+  __slots__ = ("r", "v", "a", "p00", "p01", "p11", "t", "n", "adapted")
 
   def __init__(self, r0: float, t_nanos: int):
     self._seed(r0, t_nanos)
@@ -184,6 +219,9 @@ class _SlotRangeKF:
     self.p11 = BOSCH_RADAR_KF_P0_V
     self.t = t_nanos
     self.n = 1
+    # True when the LAST update() took an innovation-adaptive (maneuver/jump) step. The emit-time settle
+    # gate treats such a step as instability and withholds the point until the track runs clean again.
+    self.adapted = False
 
   @property
   def converged(self) -> bool:
@@ -200,6 +238,7 @@ class _SlotRangeKF:
       return _KF_BREAK  # slot-reuse discontinuity; caller bumps incarnation and reseeds
 
     # predict
+    self.adapted = False
     r_pred = self.r + self.v * dt
     q_v = BOSCH_RADAR_KF_Q_V * dt
     p00 = self.p00 + 2.0 * dt * self.p01 + dt * dt * self.p11 + BOSCH_RADAR_KF_Q_R * dt
@@ -210,6 +249,7 @@ class _SlotRangeKF:
     if y * y / s > BOSCH_RADAR_KF_NIS_ADAPT:
       # innovation-adaptive Q: maneuver onset (e.g. lead brakes hard) -> trust the model less so the
       # rate snaps to the data instead of lagging optimistic
+      self.adapted = True
       extra = BOSCH_RADAR_KF_Q_V * (BOSCH_RADAR_KF_NIS_INFLATE - 1.0) * dt
       p11 += extra
       p01 += extra * dt
@@ -259,6 +299,10 @@ class RadarInterface(RadarInterfaceBase):
     # NOTE: keyed by SLOT (0..5), not trackId. trackId now carries an incarnation (S1) so it changes on
     # every (re)birth; the kinematic state must persist across that change, hence the stable slot key.
     self._kf: dict[int, _SlotRangeKF] = {}
+    # Phantom-brake fix: per-slot count of CONSECUTIVE clean KF updates (no birth/reseed/break/adapt).
+    # The emit gate requires >= BOSCH_RADAR_SETTLE_CYCLES before a point's vRel is trusted; jumpy tracks
+    # never settle and are suppressed (radard falls back to vision for that slot).
+    self._settle: dict[int, int] = {}
     # D1: frames harvested from vl_all per rcp.update() batch (vl_all is wiped each call while
     # updated_messages accumulates until the trigger), demuxed by TRACK_TAG at emit time.
     self._pending: dict[int, list[dict[str, float]]] = {}
@@ -329,6 +373,7 @@ class RadarInterface(RadarInterfaceBase):
     # clock so we emit the empty data exactly once until the trigger (0x2DC) returns.
     self.pts.clear()
     self._kf.clear()
+    self._settle.clear()
     self._pending.clear()
     self._valid_cnt.clear()
     # Do NOT reset _incarnation here: trackId no-reuse (S1) must hold across a staleness clear too, so a
@@ -360,6 +405,7 @@ class RadarInterface(RadarInterfaceBase):
     if cnt == 0:
       self.pts.pop(slot, None)
       self._kf.pop(slot, None)
+      self._settle.pop(slot, None)
 
   def _bosch_harvest_frames(self, updated_addrs):
     # D1: explode this batch's vl_all (per-signal aligned lists, one entry per parsed frame) into
@@ -488,12 +534,20 @@ class RadarInterface(RadarInterfaceBase):
       kf = self._kf.get(slot)
       if kf is None:
         kf = self._kf[slot] = _SlotRangeKF(dRel, now)
+        self._settle[slot] = 0  # fresh filter: re-accumulate clean cycles before vRel is trusted
       else:
         status = kf.update(dRel, now)
         if status == _KF_BREAK:
           self._incarnation[slot] = self._incarnation.get(slot, 0) + 1
           self.pts.pop(slot, None)
           kf = self._kf[slot] = _SlotRangeKF(dRel, now)
+          self._settle[slot] = 0  # slot-reuse discontinuity: restart the settle run
+        elif status == _KF_RESEED:
+          self._settle[slot] = 0  # long-gap reseed: stale -> fresh, vRel not yet trustworthy
+        elif kf.adapted:
+          self._settle[slot] = 0  # innovation/maneuver step: withhold until the track runs clean again
+        else:
+          self._settle[slot] = self._settle.get(slot, 0) + 1
       # S5: range_rate is an estimate until the filter has absorbed enough measurements -> NaN before
       vRel = kf.v if kf.converged else float('nan')
 
@@ -501,6 +555,24 @@ class RadarInterface(RadarInterfaceBase):
       if self._valid_cnt[slot] < BOSCH_RADAR_BORN_CYCLES:
         # Not yet confident enough to publish; keep accumulating. Drop any stale point (there should be
         # none pre-birth) but retain the counter + baseline so the next valid cycle can promote it.
+        self.pts.pop(slot, None)
+        continue
+
+      # Phantom-brake fix (lean-on-vision): only publish a point whose vRel is trustworthy. Require the KF
+      # converged, |vRel| below the hard physical ceiling, and GRADUATED PERSISTENCE -- the higher the claimed
+      # closing speed, the more consecutive clean cycles (no birth/reseed/break/maneuver) the slot must have
+      # run before we trust it. A real fast closer (a stopped car you're approaching) persists and earns it; a
+      # short-lived phantom never does. Otherwise DROP the point this cycle so radard falls back to the VISION
+      # lead -- replay of route 0543acc22b traced the phantom braking to exactly these untrusted samples.
+      absv = abs(vRel)
+      if absv <= BOSCH_RADAR_VREL_SOFT:
+        settle_req = BOSCH_RADAR_SETTLE_CYCLES
+      elif absv <= BOSCH_RADAR_VREL_MID:
+        settle_req = BOSCH_RADAR_SETTLE_MID
+      else:
+        settle_req = BOSCH_RADAR_SETTLE_HIGH
+      vrel_ok = kf.converged and absv <= BOSCH_RADAR_VREL_HARD_MAX
+      if self._settle.get(slot, 0) < settle_req or not vrel_ok:
         self.pts.pop(slot, None)
         continue
 
