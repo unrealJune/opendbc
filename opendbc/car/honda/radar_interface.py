@@ -202,6 +202,19 @@ BOSCH_RADAR_VALID_CAP = 5    # max value the per-slot confidence counter saturat
 # churn harm. trackId no-reuse (S1) is preserved: an inherited id IS the same physical object continuing.
 BOSCH_RADAR_STITCH_MAX_AGE_S = 0.25   # s; how long a deceased track stays stitchable (~4 sweeps)
 BOSCH_RADAR_STITCH_RANGE_GATE = 2.0   # m; |new range - predicted deceased range| must be under this
+# S7b -- AZIMUTH awareness (drive 00000007 seg14, multi-object same-range scene): range alone cannot
+# tell two objects in DIFFERENT LANES at the SAME range apart. Two consequences and their fixes:
+# (a) occupant SWAPS between same-range slots are invisible to the range-only BREAK test, so identities
+#     silently cross objects (in-path track inherits the adjacent lane's kinematics -> under-reported
+#     closing on the followed car + the "teleporting chevron"). A sweep-to-sweep LATERAL jump far above
+#     physical lateral motion (~0.1 m/sweep) is therefore treated exactly like a range BREAK. The gate
+#     scales with range because azimuth noise grows with range.
+# (b) the stitch gate gains the same lateral-continuity requirement so a rebirth can only inherit an
+#     identity that matches in BOTH range and azimuth.
+BOSCH_RADAR_Y_BREAK_BASE = 2.0        # m; lateral jump gate at zero range
+BOSCH_RADAR_Y_BREAK_SCALE = 0.06      # m of extra gate per meter of range
+BOSCH_RADAR_STITCH_Y_GATE_BASE = 1.5  # m; lateral continuity gate for stitching
+BOSCH_RADAR_STITCH_Y_GATE_SCALE = 0.05
 
 # S3 -- plausibility / self-consistency fault annotations (RX-only; error bits on RadarData, NOT
 # authority changes; NO new frame decoded -- this is the SAFE subset of matrix #18). (a) a decoded dRel
@@ -351,6 +364,13 @@ class _SlotRangeKF:
     return _KF_OK
 
 
+def _bosch_lat(dRel, cpt):
+  # yRel = lateral projection of the polar (range, azimuth) measurement; see the LAT_SCALE block for the
+  # field identity/scale provenance. LAT_RAW is already offset-binary-centered per the DBC.
+  az_deg = cpt['LAT_RAW'] * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB
+  return -dRel * sin(az_deg * pi / 180.0)
+
+
 def _create_bosch_can_parser(CP):
   if Bus.radar not in DBC[CP.carFingerprint]:
     return None
@@ -401,8 +421,10 @@ class RadarInterface(RadarInterfaceBase):
     # re-slotted, possibly from a DIFFERENT slot -- so the id is no longer derivable from (slot, inc)).
     self._tid: dict[int, int] = {}
     # S7: recently-deceased born tracks, stitchable by a re-slotted successor for STITCH_MAX_AGE_S.
-    # Entries: {'tid', 'slot', 'kf', 'settle', 'valid_cnt'}; age is measured from kf.t (last measurement).
+    # Entries: {'tid','slot','kf','settle','valid_cnt','y'}; age is measured from kf.t (last measurement).
     self._graveyard: list[dict] = []
+    # S7b: per-slot lateral position of the last valid frame (occupant-swap detection + stitch gating).
+    self._last_y: dict[int, float] = {}
     # S3 CNTR-stall fault: last seen trigger-slot CNTR and how many cycles it has been frozen.
     self._last_cntr: int | None = None
     self._cntr_stall = 0
@@ -481,6 +503,7 @@ class RadarInterface(RadarInterfaceBase):
     self._settle.clear()
     self._pending.clear()
     self._valid_cnt.clear()
+    self._last_y.clear()
     # Do NOT reset _incarnation here: trackId no-reuse (S1) must hold across a staleness clear too, so a
     # slot that revives after going stale gets a fresh trackId rather than reusing the pre-stale one.
     self._last_trigger_nanos = -1
@@ -516,18 +539,38 @@ class RadarInterface(RadarInterfaceBase):
       return
     self._graveyard.append({'tid': tid, 'slot': slot, 'kf': kf,
                             'settle': self._settle.get(slot, 0),
-                            'valid_cnt': self._valid_cnt.get(slot, 0)})
+                            'valid_cnt': self._valid_cnt.get(slot, 0),
+                            'y': self._last_y.get(slot, float('nan'))})
 
-  def _bosch_stitch_pop(self, slot, dRel, now, exclude_tid=None):
+  def _bosch_is_swap(self, slot, kf, dRel, y, now):
+    # S7/S7b occupant-swap test (side-effect-free): the slot's new frame is a DIFFERENT object than its
+    # current occupant if the implied range rate is unphysical (the classic BREAK) OR the lateral
+    # position jumped far beyond physical sweep-to-sweep motion (same-range, different-lane swap that
+    # range alone cannot see). Gates scale with range (azimuth noise grows with range).
+    dt = (now - kf.t) * 1e-9
+    if not (0.0 < dt <= BOSCH_RADAR_VREL_DT_MAX_S):
+      return False
+    if abs((dRel - kf.r) / dt) > BOSCH_RADAR_VREL_MAX:
+      return True
+    y_prev = self._last_y.get(slot)
+    return (y_prev is not None and not math.isnan(y_prev)
+            and abs(y - y_prev) > BOSCH_RADAR_Y_BREAK_BASE + BOSCH_RADAR_Y_BREAK_SCALE * dRel)
+
+  def _bosch_stitch_pop(self, slot, dRel, now, exclude_tid=None, y=None):
     # S7: find (and consume) the recently-deceased track whose PREDICTED range best matches the new
     # occupant of `slot`. Kills the donor slot's decaying leftover state on a cross-slot hit so the
     # object cannot double-emit from both its old and new slot.
     best = None
     best_res = BOSCH_RADAR_STITCH_RANGE_GATE
+    y_gate = BOSCH_RADAR_STITCH_Y_GATE_BASE + BOSCH_RADAR_STITCH_Y_GATE_SCALE * dRel
     for g in self._graveyard:
       kf = g['kf']
       age_s = (now - kf.t) * 1e-9
       if not (0.0 <= age_s <= BOSCH_RADAR_STITCH_MAX_AGE_S) or g['tid'] == exclude_tid:
+        continue
+      # S7b lateral continuity: range alone cannot separate same-range objects in different lanes
+      gy = g.get('y')
+      if y is not None and gy is not None and not math.isnan(gy) and abs(y - gy) > y_gate:
         continue
       res = abs(dRel - (kf.r + kf.v * age_s))
       if res < best_res:
@@ -540,6 +583,7 @@ class RadarInterface(RadarInterfaceBase):
         self.pts.pop(donor, None)
         self._kf.pop(donor, None)
         self._settle.pop(donor, None)
+        self._last_y.pop(donor, None)
         self._valid_cnt[donor] = 0
     return best
 
@@ -557,6 +601,7 @@ class RadarInterface(RadarInterfaceBase):
       self.pts.pop(slot, None)
       self._kf.pop(slot, None)
       self._settle.pop(slot, None)
+      self._last_y.pop(slot, None)
 
   def _bosch_harvest_frames(self, updated_addrs):
     # D1: explode this batch's vl_all (per-signal aligned lists, one entry per parsed frame) into
@@ -674,19 +719,21 @@ class RadarInterface(RadarInterfaceBase):
         self._bosch_clear_slot(slot)
         continue
 
-      # S7 pre-burial: this slot's occupant is about to be displaced by a different object (the same
-      # range-discontinuity test the KF's BREAK uses, side-effect-free) -> bury it now so ANY slot's
-      # stitch in pass B can find it, regardless of slot order.
+      # S7 pre-burial: this slot's occupant is about to be displaced by a DIFFERENT object -- the same
+      # range-discontinuity test the KF's BREAK uses, OR an occupant swap visible only in azimuth (S7b).
+      # Side-effect-free here -> bury it now so ANY slot's stitch in pass B can find it, regardless of
+      # slot order.
       kf = self._kf.get(slot)
-      if kf is not None:
-        dt = (now - kf.t) * 1e-9
-        if 0.0 < dt <= BOSCH_RADAR_VREL_DT_MAX_S and abs((dRel - kf.r) / dt) > BOSCH_RADAR_VREL_MAX:
-          self._bosch_bury(slot)
+      if kf is not None and self._bosch_is_swap(slot, kf, dRel, _bosch_lat(dRel, cpt), now):
+        self._bosch_bury(slot)
       live_frames[slot] = cpt
 
     # ---- pass B: birth/stitch/KF-update/emit per live slot ----------------------------------------
     for slot, cpt in live_frames.items():
       dRel = cpt['RANGE']
+      # S7b: this frame's lateral position, computed up front for swap detection + stitch gating (it is
+      # also the yRel published at emission below).
+      yRel = _bosch_lat(dRel, cpt)
 
       # S1 (re)birth detection: a slot whose confidence counter was floored at 0 BEFORE this cycle is a
       # fresh occupant -> bump its incarnation so the trackId it will be published under does not reuse
@@ -695,7 +742,7 @@ class RadarInterface(RadarInterfaceBase):
       # is sighted for BORN_CYCLES-1 cycles before it is ever published, so point-absence would mis-fire.
       was_vacant = self._valid_cnt.get(slot, 0) == 0
       if was_vacant:
-        st = self._bosch_stitch_pop(slot, dRel, now)
+        st = self._bosch_stitch_pop(slot, dRel, now, y=yRel)
         if st is not None:
           # S7 stitch: same physical object re-slotted -- inherit its trackId, KF (learned range-rate),
           # confidence and settle run, so it keeps emitting under the same identity with no born/settle
@@ -723,12 +770,14 @@ class RadarInterface(RadarInterfaceBase):
       # owns the S6 contracts (dt<=0 skip, long-gap reseed); the BREAK return keeps the S1 slot-reuse
       # semantics: bump the incarnation so radard sees a NEW trackId, drop the stale point so it is
       # re-created under that id this cycle, and reseed the filter at the new object's range.
+      # S7b: an occupant swap that only shows in AZIMUTH (same-range, different lane) must be treated
+      # exactly like a range BREAK -- and must NOT be absorbed by the old occupant's KF.
       kf = self._kf.get(slot)
       if kf is None:
         kf = self._kf[slot] = _SlotRangeKF(dRel, now)
         self._settle[slot] = 0  # fresh filter: re-accumulate clean cycles before vRel is trusted
       else:
-        status = kf.update(dRel, now)
+        status = _KF_BREAK if self._bosch_is_swap(slot, kf, dRel, yRel, now) else kf.update(dRel, now)
         if status == _KF_BREAK:
           # S7: the displaced occupant may re-slot elsewhere -> bury it (before dropping its point).
           # The NEW occupant may itself be a stitchable refugee from another slot -- but never from the
@@ -736,7 +785,7 @@ class RadarInterface(RadarInterfaceBase):
           self._bosch_bury(slot)
           old_tid = self._tid.get(slot)
           self.pts.pop(slot, None)
-          st = self._bosch_stitch_pop(slot, dRel, now, exclude_tid=old_tid)
+          st = self._bosch_stitch_pop(slot, dRel, now, exclude_tid=old_tid, y=yRel)
           if st is not None:
             self._tid[slot] = st['tid']
             kf = st['kf']
@@ -764,6 +813,10 @@ class RadarInterface(RadarInterfaceBase):
           self._settle[slot] = self._settle.get(slot, 0) + 1
       # S5: range_rate is an estimate until the filter has absorbed enough measurements -> NaN before
       vRel = kf.v if kf.converged else float('nan')
+
+      # S7b: record this frame's lateral position for next cycle's swap test + burial (also when the
+      # point is withheld below -- the slot's occupant was still SEEN here).
+      self._last_y[slot] = yRel
 
       # S2 gate: do not emit until the slot is confidently born.
       if self._valid_cnt[slot] < BOSCH_RADAR_BORN_CYCLES:
@@ -799,13 +852,12 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[slot].vRelNative = float('nan')  # set on slot 0 below when a native Doppler is available
 
       self.pts[slot].dRel = dRel
-      # yRel = lateral projection of the polar (range, azimuth) measurement. b4:b5 is AZIMUTH ANGLE
-      # (offset-binary, center 0x8000), settled by the 2026-06-08 three-source rlog regression (see the
-      # LAT_SCALE block above); LAT_RAW is already (b4b5 - 0x8000) per the DBC offset. left-positive:
-      # right-of-center (LAT_RAW > 0) -> negative yRel (rlog-confirmed sign). Scale MEDIUM-confidence
-      # (0.0009-0.001 deg/LSB band; absolute boresight zero still unpinned) but field identity is HIGH.
-      az_deg = cpt['LAT_RAW'] * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB
-      self.pts[slot].yRel = -dRel * sin(az_deg * pi / 180.0)
+      # yRel = lateral projection of the polar (range, azimuth) measurement (precomputed above via
+      # _bosch_lat). b4:b5 is AZIMUTH ANGLE (offset-binary, center 0x8000), settled by the 2026-06-08
+      # three-source rlog regression (see the LAT_SCALE block above); LAT_RAW is already (b4b5 - 0x8000)
+      # per the DBC offset. left-positive: right-of-center (LAT_RAW > 0) -> negative yRel (rlog-confirmed
+      # sign). Scale MEDIUM confidence; field identity HIGH.
+      self.pts[slot].yRel = yRel
       self.pts[slot].vRel = vRel
       # R1: pack the KF's smoothed range-accel into aRel (NaN until the filter is converged AND has a
       # rate history). RX-only telemetry; the radard-side consumer is K5 (deferred).

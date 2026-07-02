@@ -847,6 +847,41 @@ class TestS7CrossSlotStitch(unittest.TestCase):
     self.assertEqual(len(rr.points), 1)  # still emitting -- no blackout at maneuver onset
     self.assertFalse(math.isnan(rr.points[0].vRel))
 
+  def test_same_range_lane_swap_breaks_identity(self):
+    # S7b: two objects at the SAME range in different lanes swap slot occupancy -- invisible to the
+    # range-only BREAK test. The azimuth jump must break the identity (new trackId, point withheld)
+    # instead of silently letting the old id absorb the other lane's kinematics.
+    raw24 = 7563  # ~24.0 m
+    # y = -d*sin(az): lat_raw 0x477A -> LAT_RAW = -14470 -> az ~ -14.47 deg -> y ~ +6.0 m at 24 m
+    LAT_6M = 0x477A
+    for k in range(self.WARM):
+      cntr = (0x10 + k) & 0xFF
+      rr = self.ri.update(_can(k * self.DT_NS,
+                               [self._f(0x280, _hdr_frame(raw24, cntr=cntr))] + [self._trig(cntr)]))
+    tid = rr.points[0].trackId
+    self.assertAlmostEqual(rr.points[0].yRel, 0.0, delta=0.1)
+    # same range, lateral position jumps ~6 m in one sweep: a different object took the slot
+    cntr = (0x10 + self.WARM) & 0xFF
+    rr = self.ri.update(_can(self.WARM * self.DT_NS,
+                             [self._f(0x280, _hdr_frame(raw24, lat_raw=LAT_6M, cntr=cntr))] + [self._trig(cntr)]))
+    self.assertEqual(len([p for p in rr.points if p.trackId == tid]), 0)  # old identity gone
+    self.assertEqual(len(rr.points), 0)  # new occupant pays the settle warmup (withheld)
+    self.assertNotEqual(self.ri._tid[0], tid)
+
+  def test_stitch_requires_lateral_continuity(self):
+    # S7b: a rebirth at the SAME range but a very different lateral position must NOT inherit the dead
+    # track's identity (range alone cannot distinguish same-range objects in different lanes).
+    raw24 = 7563
+    LAT_6M = 0x477A
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: raw24})
+    tid = rr.points[0].trackId
+    self._sweep(self.WARM, {})  # one absent sweep buries the born track
+    cntr = (0x10 + self.WARM + 1) & 0xFF
+    rr = self.ri.update(_can((self.WARM + 1) * self.DT_NS,
+                             [self._f(0x280, _hdr_frame(raw24, lat_raw=LAT_6M, cntr=cntr))] + [self._trig(cntr)]))
+    self.assertNotEqual(self.ri._tid[0], tid)  # NOT stitched: fresh identity despite matching range
+
   def test_young_track_still_zeroed_on_maneuver_step(self):
     # The same adaptive step on a YOUNG track (settle < MATURE) still zeroes the run and withholds the
     # point: the validated churn/phantom protection is unchanged for unproven tracks.
