@@ -33,6 +33,8 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_RAW_SAT,
   BOSCH_RADAR_CNTR_STALL_CYCLES,
   BOSCH_RADAR_VREL_DT_MAX_S,
+  BOSCH_RADAR_SELECTED_MSG,
+  BOSCH_RADAR_SEL_VREL_AGREE,
 )
 from opendbc.car.honda.values import CAR, DBC
 
@@ -169,6 +171,66 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertTrue(p.measured)
     self.assertFalse(math.isnan(p.vRel))
     self.assertAlmostEqual(p.aRel, 0.0, delta=1.0)
+
+  def _sel_frame(self, rel_speed_raw, *, strength=100, sel_range=5000, sel_lat=0x8000, cntr=0x10):
+    # 0x2C8 RADAR_SELECTED_0: b0=SEL_STRENGTH, b1=SEL_CNTR_LO, b2:b3=SEL_RANGE, b4:b5=SEL_LAT,
+    # b6=REL_SPEED raw (native Doppler; vRel = -0.7*raw + 86.5, ~0 at raw 124), b7=SEL_CNTR.
+    return self._f(BOSCH_RADAR_SELECTED_MSG,
+                   _frame(strength, cntr, (sel_range >> 8) & 0xFF, sel_range & 0xFF,
+                          (sel_lat >> 8) & 0xFF, sel_lat & 0xFF, rel_speed_raw, cntr))
+
+  def _warm_with_sel(self, range_raw, rel_speed_raw, **sel_kw):
+    # Warm slot 0 steady while also feeding a 0x2C8 selected-lead frame each sweep. Returns last rr.
+    dt_ns = int(0.05 * 1e9)
+    rr = None
+    for k in range(self.WARM_CYCLES):
+      cntr = (0x10 + k) & 0xFF
+      body = [self._f(0x280, _hdr_frame(range_raw, cntr=cntr)), self._sel_frame(rel_speed_raw, cntr=cntr, **sel_kw)]
+      rr = self._emit(k * dt_ns, body, cntr)
+    return rr
+
+  def test_native_doppler_attached_to_slot0_when_agreeing(self):
+    # A valid selected lead whose native Doppler (~0 at raw 124) agrees with slot 0's derived vRel (~0
+    # for a steady lead) -> vRelNative set on slot 0's point. RX-only: vRel/dRel are UNCHANGED.
+    rr = self._warm_with_sel(3999, 124)
+    p = rr.points[0]
+    self.assertFalse(math.isnan(p.vRelNative))
+    self.assertAlmostEqual(p.vRelNative, -0.7 * 124 + 86.5, places=2)
+    # no control change: vRel is still the derived (~0) value, dRel unchanged
+    self.assertAlmostEqual(p.dRel, 0.00357 * 3999 - 3.0, places=4)
+    self.assertFalse(math.isnan(p.vRel))
+
+  def test_native_doppler_nan_without_selected_frame(self):
+    # No 0x2C8 fed -> vRelNative stays NaN (the isolated parser sees a sentinel/default).
+    rr = self._warm(3999)
+    self.assertTrue(math.isnan(rr.points[0].vRelNative))
+
+  def test_native_doppler_rejected_on_gross_disagreement(self):
+    # Selected-lead Doppler implying a large closing speed while slot 0 is steady (vRel~0) -> the
+    # association check (|REL_SPEED - vRel| < AGREE) rejects it (different object) -> vRelNative NaN.
+    raw_fast = int(round((-20.0 - 86.5) / -0.7))  # REL_SPEED ~ -20 m/s (hard closing), |diff| >> AGREE
+    self.assertGreater(abs((-0.7 * raw_fast + 86.5)), BOSCH_RADAR_SEL_VREL_AGREE)
+    rr = self._warm_with_sel(3999, raw_fast)
+    self.assertTrue(math.isnan(rr.points[0].vRelNative))
+
+  def test_native_doppler_nan_when_selected_sentinel(self):
+    # An idle-strength selected frame (no selected lead) -> vRelNative NaN even though 0x2C8 is present.
+    rr = self._warm_with_sel(3999, 124, strength=0xFE)
+    self.assertTrue(math.isnan(rr.points[0].vRelNative))
+
+  def test_native_doppler_does_not_change_vrel_or_drel(self):
+    # RX-only guarantee: feeding the selected-lead frame must NOT change the emitted vRel/dRel of slot 0
+    # (only vRelNative is added). Compare a warm WITHOUT any 0x2C8 to an identical warm WITH one.
+    rr_no = self._warm(3999)
+    p_no = rr_no.points[0]
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+    rr_yes = self._warm_with_sel(3999, 124)
+    p_yes = rr_yes.points[0]
+    self.assertAlmostEqual(p_no.vRel, p_yes.vRel, places=6)
+    self.assertAlmostEqual(p_no.dRel, p_yes.dRel, places=6)
+    self.assertTrue(math.isnan(p_no.vRelNative))
+    self.assertFalse(math.isnan(p_yes.vRelNative))
 
   def test_b1_tag_gate_skips_nonheader(self):
     # b1 != 0x74 -> non-range sub-frame -> skipped (no point), even with a plausible range field.
@@ -680,6 +742,123 @@ class TestCivicBoschFineRealCapture(unittest.TestCase):
         max_pts = max(max_pts, len(rr.points))
     # All frames are b0==0xFE idle / b1==0xF0 (never 0x74) -> every frame skipped -> 0 points ever.
     self.assertEqual(max_pts, 0)
+
+
+class TestS7CrossSlotStitch(unittest.TestCase):
+  """S7 cross-slot identity stitch: the radar keeps the fine table ~sorted by range, so one object
+  appearing/disappearing shifts EVERY track a slot within one sweep. A born track must survive that
+  re-slotting with its trackId/KF/settle intact (no emit hole), while genuinely different objects must
+  NOT be stitched. Also covers the SETTLE_MATURE maneuver-step decay."""
+
+  TRIG = 0x2DC
+  DT_NS = int(0.05 * 1e9)
+
+  def setUp(self):
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+
+  def _f(self, addr, frame):
+    return (addr, frame, self.bus)
+
+  def _trig(self, cntr):
+    return self._f(self.TRIG, _hdr_frame(0x8000, tag=0xF0, strength=0xFE, cntr=cntr))
+
+  def _sweep(self, k, slot_ranges, cntr0=0x10):
+    # One sweep at cycle k: {header_addr: range_raw} + the trigger terminator.
+    cntr = (cntr0 + k) & 0xFF
+    body = [self._f(a, _hdr_frame(rr, cntr=cntr)) for a, rr in slot_ranges.items()]
+    return self.ri.update(_can(k * self.DT_NS, body + [self._trig(cntr)]))
+
+  WARM = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES + 2
+
+  def test_table_shift_preserves_trackid_no_emit_hole(self):
+    # Object born+settled in slot 1 (0x284) at ~24 m; a second far object sits in slot 2. The near
+    # object then SHIFTS to slot 0 in one sweep (table re-sort) while slot 1 takes the far object.
+    raw24, raw36 = 7563, 10924  # ~24.0 m, ~36.0 m
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x284: raw24, 0x288: raw36})
+    ids = {p.trackId: p for p in rr.points}
+    self.assertEqual(len(ids), 2)
+    tid24 = next(t for t, p in ids.items() if abs(p.dRel - 24.0) < 0.5)
+    self.assertFalse(math.isnan(ids[tid24].vRel))
+    # the shift sweep: 24 m object now on 0x280, 36 m object now on 0x284, 0x288 goes quiet
+    rr = self._sweep(self.WARM, {0x280: raw24, 0x284: raw36})
+    self.assertIsNotNone(rr)
+    pts24 = [p for p in rr.points if abs(p.dRel - 24.0) < 0.5]
+    # no emit hole: the re-slotted object is present on the VERY shift sweep, same id, finite vRel
+    self.assertEqual(len(pts24), 1)
+    self.assertEqual(pts24[0].trackId, tid24)
+    self.assertFalse(math.isnan(pts24[0].vRel))
+    # and it keeps emitting under the same id on the following sweep
+    rr = self._sweep(self.WARM + 1, {0x280: raw24, 0x284: raw36})
+    pts24 = [p for p in rr.points if abs(p.dRel - 24.0) < 0.5]
+    self.assertEqual(len(pts24), 1)
+    self.assertEqual(pts24[0].trackId, tid24)
+
+  def test_distinct_object_not_stitched(self):
+    # A 20 m track dies; a 30 m object (outside the 2 m stitch gate) takes the slot within the stitch
+    # window -> it must get a NEW trackId and pay the normal born/settle warmup (no instant emit).
+    raw20, raw30 = 6443, 9244  # ~20.0 m, ~30.0 m
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: raw20})
+    tid20 = rr.points[0].trackId
+    # one absent sweep (decays confidence; buries a graveyard copy), then the different object appears
+    self._sweep(self.WARM, {})
+    rr = self._sweep(self.WARM + 1, {0x280: raw30})
+    pts30 = [p for p in rr.points if abs(p.dRel - 30.0) < 0.5]
+    self.assertEqual(len(pts30), 0)  # normal warmup: no instant emit for a genuinely new object
+    for k in range(self.WARM + 2, 2 * self.WARM + 2):
+      rr = self._sweep(k, {0x280: raw30})
+    pts30 = [p for p in rr.points if abs(p.dRel - 30.0) < 0.5]
+    self.assertEqual(len(pts30), 1)
+    self.assertNotEqual(pts30[0].trackId, tid20)
+
+  def test_stitch_window_expiry_new_trackid(self):
+    # Same range, but the object is gone for LONGER than the stitch window -> graveyard entry expired
+    # -> rebirth is a NEW identity with the normal warmup.
+    raw25 = 7843  # ~25.0 m
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: raw25})
+    tid = rr.points[0].trackId
+    gap_sweeps = 8  # 8 * 50 ms = 0.4 s > STITCH_MAX_AGE_S (0.25 s); also floors valid_cnt
+    for k in range(self.WARM, self.WARM + gap_sweeps):
+      self._sweep(k, {})
+    rr = None
+    for k in range(self.WARM + gap_sweeps, self.WARM + gap_sweeps + self.WARM):
+      rr = self._sweep(k, {0x280: raw25})
+    self.assertEqual(len(rr.points), 1)
+    self.assertNotEqual(rr.points[0].trackId, tid)
+
+  def test_mature_track_survives_maneuver_step(self):
+    # A mature track (long clean settle run) that takes a KF innovation-adaptive step (lead starts
+    # braking) keeps emitting: settle decays to SETTLE_CYCLES, not 0 -> no 3-sweep blackout.
+    from opendbc.car.honda.radar_interface import BOSCH_RADAR_SETTLE_MATURE
+    raw = 9244  # ~30.0 m
+    n_warm = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_MATURE + 3
+    for k in range(n_warm):
+      rr = self._sweep(k, {0x280: raw})
+    self.assertGreaterEqual(self.ri._settle[0], BOSCH_RADAR_SETTLE_MATURE)
+    self.assertEqual(len(rr.points), 1)
+    # one 0.6 m range step in a 50 ms sweep (~12 m/s implied jump: adaptive, far below the 30 m/s BREAK)
+    raw_step = raw - 168
+    rr = self._sweep(n_warm, {0x280: raw_step})
+    self.assertTrue(self.ri._kf[0].adapted)  # the maneuver branch actually fired
+    self.assertEqual(self.ri._settle[0], BOSCH_RADAR_SETTLE_CYCLES)  # decayed, NOT zeroed
+    self.assertEqual(len(rr.points), 1)  # still emitting -- no blackout at maneuver onset
+    self.assertFalse(math.isnan(rr.points[0].vRel))
+
+  def test_young_track_still_zeroed_on_maneuver_step(self):
+    # The same adaptive step on a YOUNG track (settle < MATURE) still zeroes the run and withholds the
+    # point: the validated churn/phantom protection is unchanged for unproven tracks.
+    raw = 9244
+    n_warm = self.WARM  # born + settled, but far below MATURE
+    for k in range(n_warm):
+      rr = self._sweep(k, {0x280: raw})
+    self.assertEqual(len(rr.points), 1)
+    rr = self._sweep(n_warm, {0x280: raw - 168})
+    self.assertTrue(self.ri._kf[0].adapted)
+    self.assertEqual(self.ri._settle[0], 0)
+    self.assertEqual(len(rr.points), 0)  # withheld while it re-proves itself
 
 
 if __name__ == "__main__":

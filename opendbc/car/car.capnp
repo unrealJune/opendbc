@@ -323,6 +323,11 @@ struct RadarData @0x888ad6581cf0aacb {
 
     # some radars flag measurements VS estimates
     measured @6 :Bool;
+
+    # native radar-reported relative velocity (Doppler) for this track, if the radar publishes one
+    # separately from the (possibly derived) vRel. NaN when unavailable. Kept DISTINCT from vRel so
+    # exposing it never changes vRel-based control; consumers (e.g. radard) may fuse it with vRel/vision.
+    vRelNative @7 :Float32;
   }
 
   enum ErrorDEPRECATED {

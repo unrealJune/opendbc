@@ -64,6 +64,27 @@ BOSCH_RADAR_STRENGTH_IDLE = 0xFE
 BOSCH_RADAR_RAW_UNSET = 0x8000
 BOSCH_RADAR_RAW_SAT = 0xFF80
 
+# --- Native Doppler exposure (RX-only telemetry; NO control change) ------------------------------
+# The radar's SELECTED-lead coarse output 0x2C8 (RADAR_SELECTED_0) carries REL_SPEED -- a REAL
+# published relative velocity (Doppler) for the radar's own ACC target, unlike the FINE per-track vRel
+# which the parser DERIVES from range. Mined 2026-07-01 (tmp_radar/mine_*.py; drives 00000007 highway
+# + 00000003 night): the selected lead associates to FINE SLOT 0 (0x280, the closest track) at r=0.84
+# vs slot0's own range-rate, so the native Doppler is attached to SLOT 0's RadarPoint (field
+# vRelNative). The zero-point is rock-stable (REL_SPEED=0 at raw ~124, DBC-encoded) but the SCALE is
+# coarse/drive-dependent (~0.7-1.1 m/s/LSB). It is EXPOSED, NOT fused into vRel: an offline replay
+# showed a standalone vRel veto using it damps ~10-26% of REAL closings (unsafe without vision), while
+# a safe version yields no benefit -- the fusion belongs radard-side (with vision + path). radard reads
+# vRelNative to cross-check the DERIVED vRel's false-closing. See tmp_radar/RADARD_HANDOFF.md.
+BOSCH_RADAR_SELECTED_MSG = 0x2C8
+BOSCH_RADAR_SEL_STRENGTH_IDLE = frozenset({0x00, 0xFE})  # B0 idle/unset sentinels -> no selected lead
+BOSCH_RADAR_SEL_RANGE_UNSET = 0x8000
+BOSCH_RADAR_SEL_RANGE_SAT = 0xFF80
+# Association sanity gate: only attach the selected-lead Doppler to slot 0 when it AGREES with slot0's
+# own DERIVED vRel within this bound. Calibration-free cross-check that rejects the case where the radar
+# selected a DIFFERENT object than slot 0. Generous -- the false-closing disagreements radard cares
+# about are 1-4 m/s; this only rejects gross wrong-object mismatches (and NaN slot0 vRel).
+BOSCH_RADAR_SEL_VREL_AGREE = 8.0  # m/s
+
 # b4:b5 FIELD IDENTITY = AZIMUTH ANGLE (offset-binary, center 0x8000), NOT range-rate.
 # SETTLED 2026-06-08 by a three-source rlog regression against the vision-model lead (no flash, no TX,
 # no Ghidra, no controlled/tape capture) -- radar-re/latscale/_rlog/{peter-3d,peter-49,joey}.md and
@@ -140,6 +161,12 @@ BOSCH_RADAR_SETTLE_HIGH = 18       # clean cycles required to trust |vRel| in (M
 # run, so they are suppressed (radard uses vision); a real, smoothly-tracked lead settles in ~0.15 s and
 # emits continuously. SETTLE_CYCLES > KF_CONV_UPDATES so vRel is always converged by the time it emits.
 BOSCH_RADAR_SETTLE_CYCLES = 3
+# A track with at least this many consecutive clean cycles behind it is MATURE: an innovation-adaptive
+# (maneuver) step decays its settle run to SETTLE_CYCLES instead of zeroing it, so a real lead that
+# starts braking keeps emitting (soft-|vRel| band) instead of blanking for 3 sweeps at maneuver onset.
+# Young/churny tracks still zero -- the validated phantom protection is unchanged for them, and the
+# graduated high-|vRel| bands (SETTLE_MID/HIGH) still demand a fresh clean run either way.
+BOSCH_RADAR_SETTLE_MATURE = 20
 
 # --- SAFE parity hardening constants (PARITY-MATRIX §3/§4; RX-only, keep-AEB preserved) ----------
 # S1 -- trackId no-reuse (capnp car.capnp:314 "no trackId reuse"). trackId is no longer the bare slot
@@ -158,6 +185,23 @@ BOSCH_RADAR_TRACKID_STRIDE = 1000  # trackId = slot * STRIDE + incarnation
 # update() and the whole-bus-silent path are UNCHANGED and still win (a whole-bus silence wipes all).
 BOSCH_RADAR_BORN_CYCLES = 2  # consecutive valid cycles required before a slot emits a point
 BOSCH_RADAR_VALID_CAP = 5    # max value the per-slot confidence counter saturates at
+
+# S7 -- cross-slot identity stitch (2026-07-01, drive 4b775e9a/00000005 + 00000007 seg14 diagnosis).
+# The radar re-sorts objects between fine-table slots (priority churn): in traffic the FOLLOWED LEAD hops
+# slots every ~1-2 s. Without stitching every hop is a fresh incarnation -- BORN+SETTLE withholding (a
+# ~3-sweep emit hole) plus a NEW trackId (radard KF reset + re-association penalty) -- so the fused lead
+# steps to vision-only values and back (4-6 m) about once a second: the residual "phantom brake /
+# follow-too-far / jumping chevron" driver AFTER the vRel gates. Measured on seg14 (steady highway
+# follow): 34 of 54 lead-track dropouts were exactly the 3-sweep settle hole and the one physical lead
+# wore 72 trackIds in 45 s. Stitch: when a slot (re)births, search recently-deceased born tracks for one
+# whose PREDICTED range (last KF range + range_rate * gap) matches the new occupant inside a tight gate;
+# on a hit the new occupant INHERITS the dead track's trackId, KF (the learned range-rate), confidence
+# and settle run -> no emit hole, no id change; radard sees one continuous object. The gate is tight
+# (range-continuity over <= ~4 sweeps) so distinct objects don't stitch; a worst-case mis-stitch of two
+# near-coincident same-range objects costs a few KF cycles of adaptation, far less than the guaranteed
+# churn harm. trackId no-reuse (S1) is preserved: an inherited id IS the same physical object continuing.
+BOSCH_RADAR_STITCH_MAX_AGE_S = 0.25   # s; how long a deceased track stays stitchable (~4 sweeps)
+BOSCH_RADAR_STITCH_RANGE_GATE = 2.0   # m; |new range - predicted deceased range| must be under this
 
 # S3 -- plausibility / self-consistency fault annotations (RX-only; error bits on RadarData, NOT
 # authority changes; NO new frame decoded -- this is the SAFE subset of matrix #18). (a) a decoded dRel
@@ -246,6 +290,19 @@ class _SlotRangeKF:
   def converged(self) -> bool:
     return self.n >= BOSCH_RADAR_KF_CONV_UPDATES
 
+  def restitch(self, z: float, t_nanos: int):
+    # S7: re-anchor the range at the successor slot's measurement (a re-slotted return often shifts the
+    # reflection point slightly) while KEEPING the learned range-rate -- inheriting v is the entire point
+    # of the stitch. Covariances restart at measurement level with a modest (not seed-huge) rate variance
+    # so the following cycles refine v rather than re-learn it; `adapted` is cleared so the settle run
+    # continues uninterrupted. n is kept: the filter stays converged across the stitch.
+    self.r = z
+    self.p00 = BOSCH_RADAR_KF_R
+    self.p01 = 0.0
+    self.p11 = max(self.p11, 4.0 * BOSCH_RADAR_KF_Q_V)  # rate uncertainty grew over the unobserved gap
+    self.t = t_nanos
+    self.adapted = False
+
   def update(self, z: float, t_nanos: int) -> int:
     dt = (t_nanos - self.t) * 1e-9
     if dt <= 0:
@@ -301,6 +358,15 @@ def _create_bosch_can_parser(CP):
   return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, CanBus(CP).camera)
 
 
+def _create_bosch_selected_parser(CP):
+  # SEPARATE parser for the SELECTED-lead coarse frame 0x2C8 (native Doppler telemetry). Kept isolated
+  # from the fine-track parser so this RX-only telemetry NEVER affects the radar's can_valid / fault
+  # logic: if 0x2C8 ever goes missing, only vRelNative degrades (to NaN), not the core radar health.
+  if Bus.radar not in DBC[CP.carFingerprint]:
+    return None
+  return CANParser(DBC[CP.carFingerprint][Bus.radar], [(BOSCH_RADAR_SELECTED_MSG, 20)], CanBus(CP).camera)
+
+
 class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
@@ -330,6 +396,13 @@ class RadarInterface(RadarInterfaceBase):
     self._valid_cnt: dict[int, int] = {}
     # S1 trackId no-reuse: slot index -> current incarnation (bumped on (re)birth / slot-reuse break).
     self._incarnation: dict[int, int] = {}
+    # S7: slot index -> the trackId the slot currently publishes under. Assigned at (re)birth: either a
+    # fresh slot*STRIDE+incarnation id, or INHERITED from a stitched predecessor (same physical object
+    # re-slotted, possibly from a DIFFERENT slot -- so the id is no longer derivable from (slot, inc)).
+    self._tid: dict[int, int] = {}
+    # S7: recently-deceased born tracks, stitchable by a re-slotted successor for STITCH_MAX_AGE_S.
+    # Entries: {'tid', 'slot', 'kf', 'settle', 'valid_cnt'}; age is measured from kf.t (last measurement).
+    self._graveyard: list[dict] = []
     # S3 CNTR-stall fault: last seen trigger-slot CNTR and how many cycles it has been frozen.
     self._last_cntr: int | None = None
     self._cntr_stall = 0
@@ -341,9 +414,13 @@ class RadarInterface(RadarInterfaceBase):
 
     if self.radar_off_can:
       self.rcp = None
+      self.rcp_sel = None
       self.trigger_msg = 0x445
     elif self.bosch_radar:
       self.rcp = _create_bosch_can_parser(CP)
+      # RX-only native-Doppler telemetry parser (0x2C8), isolated from self.rcp so it can never affect
+      # the radar's can_valid / fault logic. See _create_bosch_selected_parser / vRelNative.
+      self.rcp_sel = _create_bosch_selected_parser(CP)
       # S4 sweep-coherent trigger: the radar emits a 6-slot sweep as a short burst on consecutive header
       # IDs, HEAD-first (0x280 leads, 0x2DC terminates -- confirmed across the bfcar capture: 234 sweeps,
       # 0x280->0x2DC intra-sweep span mean 8.4 ms / max 20.2 ms, well under the ~60 ms inter-sweep
@@ -357,6 +434,7 @@ class RadarInterface(RadarInterfaceBase):
       self.trigger_msg = 0x2DC
     else:
       self.rcp = _create_nidec_can_parser(CP.carFingerprint)
+      self.rcp_sel = None
       self.trigger_msg = 0x445
     self.updated_messages = set()
 
@@ -370,6 +448,10 @@ class RadarInterface(RadarInterfaceBase):
       # D1: harvest NOW -- vl_all is cleared on the next rcp.update() call, but the emit window
       # (trigger-gated) can span several update batches.
       self._bosch_harvest_frames(vls)
+      # RX-only: advance the isolated native-Doppler parser so vl[0x2C8] is fresh at emit time. Its
+      # validity does NOT gate anything (a missing 0x2C8 only leaves vRelNative NaN).
+      if self.rcp_sel is not None:
+        self.rcp_sel.update(can_strings)
 
     if self.trigger_msg not in self.updated_messages:
       # Staleness fallback (Bosch fine only): the trigger header (sweep terminator 0x2DC) drives the
@@ -390,6 +472,10 @@ class RadarInterface(RadarInterfaceBase):
     # Clear all tracks + vRel history and return an EMPTY RadarData (NOT None) so liveTracks keeps
     # publishing at 20 Hz with zero points -> radard drops the lead within a cycle. Reset the trigger
     # clock so we emit the empty data exactly once until the trigger (0x2DC) returns.
+    # S7: bury the live tracks first -- if the trigger returns inside the stitch window (a short bus
+    # hiccup), the same physical objects resume under their prior identities instead of churning.
+    for slot in list(self.pts):
+      self._bosch_bury(slot)
     self.pts.clear()
     self._kf.clear()
     self._settle.clear()
@@ -412,6 +498,51 @@ class RadarInterface(RadarInterfaceBase):
     # to object B presents radard a DIFFERENT trackId (capnp car.capnp:314 "no trackId reuse").
     return slot * BOSCH_RADAR_TRACKID_STRIDE + self._incarnation.get(slot, 0)
 
+  def _bosch_fresh_tid(self, slot):
+    # S1: mint a brand-new trackId for a fresh occupant of this slot (no stitchable predecessor).
+    self._incarnation[slot] = self._incarnation.get(slot, 0) + 1
+    return self._bosch_trackid(slot)
+
+  def _bosch_bury(self, slot):
+    # S7: copy a BORN track's identity + kinematics into the graveyard so a re-slotted successor can
+    # inherit them. Non-destructive (the caller owns the slot's live state) and idempotent per tid.
+    # Only born, converged tracks are worth stitching: an unborn sighting has no published identity or
+    # trusted range-rate to preserve.
+    kf = self._kf.get(slot)
+    tid = self._tid.get(slot)
+    if kf is None or tid is None or not kf.converged or self._valid_cnt.get(slot, 0) < BOSCH_RADAR_BORN_CYCLES:
+      return
+    if any(g['tid'] == tid for g in self._graveyard):
+      return
+    self._graveyard.append({'tid': tid, 'slot': slot, 'kf': kf,
+                            'settle': self._settle.get(slot, 0),
+                            'valid_cnt': self._valid_cnt.get(slot, 0)})
+
+  def _bosch_stitch_pop(self, slot, dRel, now, exclude_tid=None):
+    # S7: find (and consume) the recently-deceased track whose PREDICTED range best matches the new
+    # occupant of `slot`. Kills the donor slot's decaying leftover state on a cross-slot hit so the
+    # object cannot double-emit from both its old and new slot.
+    best = None
+    best_res = BOSCH_RADAR_STITCH_RANGE_GATE
+    for g in self._graveyard:
+      kf = g['kf']
+      age_s = (now - kf.t) * 1e-9
+      if not (0.0 <= age_s <= BOSCH_RADAR_STITCH_MAX_AGE_S) or g['tid'] == exclude_tid:
+        continue
+      res = abs(dRel - (kf.r + kf.v * age_s))
+      if res < best_res:
+        best, best_res = g, res
+    if best is not None:
+      self._graveyard.remove(best)
+      donor = best['slot']
+      if donor != slot and self._tid.get(donor) == best['tid']:
+        # the S2 hysteresis keeps a decaying copy alive in the donor slot for a few cycles -- clear it
+        self.pts.pop(donor, None)
+        self._kf.pop(donor, None)
+        self._settle.pop(donor, None)
+        self._valid_cnt[donor] = 0
+    return best
+
   def _bosch_clear_slot(self, slot):
     # S2 persist hysteresis on an absent/sentinel/wrong-tag/out-of-band cycle: decay the per-slot
     # confidence counter by 1 (floored at 0). The point + vRel history are RETAINED while the counter is
@@ -419,6 +550,7 @@ class RadarInterface(RadarInterfaceBase):
     # once the counter floors at 0 (two clean missed cycles from a born point). The incarnation is NOT
     # touched here; it is bumped at (re)birth so the NEXT object to occupy this slot gets a fresh trackId.
     # pts/_hist are keyed by SLOT internally; the wire trackId lives on the point object's .trackId field.
+    self._bosch_bury(slot)  # S7: first absent/sentinel cycle copies a born track to the graveyard
     cnt = max(self._valid_cnt.get(slot, 0) - 1, 0)
     self._valid_cnt[slot] = cnt
     if cnt == 0:
@@ -481,6 +613,9 @@ class RadarInterface(RadarInterfaceBase):
     # it seen so the staleness fallback in update() can detect when the trigger later goes quiet.
     self._last_trigger_nanos = now
 
+    # S7: expire graveyard entries past the stitch window (age measured from the last real measurement).
+    self._graveyard = [g for g in self._graveyard if (now - g['kf'].t) * 1e-9 <= BOSCH_RADAR_STITCH_MAX_AGE_S]
+
     # S3(b) CNTR-stall plausibility: track the trigger slot's CNTR. If it freezes while can_valid the
     # source is present-but-frozen -> radarFault. The trigger (0x2DC) is guaranteed present this cycle (it
     # is what gated us into _update_bosch), and every header carries the same 8-bit CNTR (DBC bit 63).
@@ -494,6 +629,12 @@ class RadarInterface(RadarInterfaceBase):
     if self.rcp.can_valid and self._cntr_stall >= BOSCH_RADAR_CNTR_STALL_CYCLES:
       ret.errors.radarFault = True
 
+    # ---- S7 pass A: classify every slot and bury displaced/vanished occupants TABLE-WIDE first. ----
+    # The radar keeps the fine table ~sorted by range (nearest object = slot 0), so a single object
+    # appearing/disappearing near the front shifts EVERY track a slot in the SAME sweep. A stitch lookup
+    # in ascending slot order would then always run before its donor slot's burial (the donor sits one
+    # slot HIGHER); burials must therefore complete for the whole table before any stitch is attempted.
+    live_frames: dict[int, dict[str, float]] = {}
     for ii in BOSCH_RADAR_HDR_MSGS:
       slot = BOSCH_RADAR_HDR_MSGS.index(ii)
 
@@ -533,6 +674,20 @@ class RadarInterface(RadarInterfaceBase):
         self._bosch_clear_slot(slot)
         continue
 
+      # S7 pre-burial: this slot's occupant is about to be displaced by a different object (the same
+      # range-discontinuity test the KF's BREAK uses, side-effect-free) -> bury it now so ANY slot's
+      # stitch in pass B can find it, regardless of slot order.
+      kf = self._kf.get(slot)
+      if kf is not None:
+        dt = (now - kf.t) * 1e-9
+        if 0.0 < dt <= BOSCH_RADAR_VREL_DT_MAX_S and abs((dRel - kf.r) / dt) > BOSCH_RADAR_VREL_MAX:
+          self._bosch_bury(slot)
+      live_frames[slot] = cpt
+
+    # ---- pass B: birth/stitch/KF-update/emit per live slot ----------------------------------------
+    for slot, cpt in live_frames.items():
+      dRel = cpt['RANGE']
+
       # S1 (re)birth detection: a slot whose confidence counter was floored at 0 BEFORE this cycle is a
       # fresh occupant -> bump its incarnation so the trackId it will be published under does not reuse
       # the prior occupant's, and clear its vRel baseline so the first derived sample is clean. Detect
@@ -540,8 +695,25 @@ class RadarInterface(RadarInterfaceBase):
       # is sighted for BORN_CYCLES-1 cycles before it is ever published, so point-absence would mis-fire.
       was_vacant = self._valid_cnt.get(slot, 0) == 0
       if was_vacant:
-        self._incarnation[slot] = self._incarnation.get(slot, 0) + 1
-        self._kf.pop(slot, None)
+        st = self._bosch_stitch_pop(slot, dRel, now)
+        if st is not None:
+          # S7 stitch: same physical object re-slotted -- inherit its trackId, KF (learned range-rate),
+          # confidence and settle run, so it keeps emitting under the same identity with no born/settle
+          # hole and radard's tracker never resets.
+          self._tid[slot] = st['tid']
+          kf_in = st['kf']
+          kf_in.restitch(dRel, now)
+          self._kf[slot] = kf_in
+          self._settle[slot] = st['settle']
+          self._valid_cnt[slot] = st['valid_cnt']
+        else:
+          self._tid[slot] = self._bosch_fresh_tid(slot)
+          self._kf.pop(slot, None)
+      elif self._graveyard:
+        # S7: the slot's own object is still live (S2 flicker tolerance) -- invalidate any graveyard copy
+        # made on an absent cycle so it cannot be stitched onto a different slot while alive here.
+        tid = self._tid.get(slot)
+        self._graveyard = [g for g in self._graveyard if g['tid'] != tid]
 
       # S2 birth/persist hysteresis: this is a valid range-carrier frame -> +1 (saturating). A point is
       # only emitted once the counter reaches BORN_CYCLES (debounces a 1-frame glitch into a phantom).
@@ -558,14 +730,36 @@ class RadarInterface(RadarInterfaceBase):
       else:
         status = kf.update(dRel, now)
         if status == _KF_BREAK:
-          self._incarnation[slot] = self._incarnation.get(slot, 0) + 1
+          # S7: the displaced occupant may re-slot elsewhere -> bury it (before dropping its point).
+          # The NEW occupant may itself be a stitchable refugee from another slot -- but never from the
+          # occupant it just displaced (exclude_tid), which is a different object by definition of BREAK.
+          self._bosch_bury(slot)
+          old_tid = self._tid.get(slot)
           self.pts.pop(slot, None)
-          kf = self._kf[slot] = _SlotRangeKF(dRel, now)
-          self._settle[slot] = 0  # slot-reuse discontinuity: restart the settle run
+          st = self._bosch_stitch_pop(slot, dRel, now, exclude_tid=old_tid)
+          if st is not None:
+            self._tid[slot] = st['tid']
+            kf = st['kf']
+            kf.restitch(dRel, now)
+            self._kf[slot] = kf
+            self._settle[slot] = st['settle']
+            self._valid_cnt[slot] = min(st['valid_cnt'] + 1, BOSCH_RADAR_VALID_CAP)
+          else:
+            self._tid[slot] = self._bosch_fresh_tid(slot)
+            kf = self._kf[slot] = _SlotRangeKF(dRel, now)
+            self._settle[slot] = 0  # slot-reuse discontinuity: restart the settle run
         elif status == _KF_RESEED:
           self._settle[slot] = 0  # long-gap reseed: stale -> fresh, vRel not yet trustworthy
         elif kf.adapted:
-          self._settle[slot] = 0  # innovation/maneuver step: withhold until the track runs clean again
+          # Innovation/maneuver step. For a YOUNG track this is churn -> withhold until it runs clean
+          # (settle=0, the validated phantom protection). For a MATURE track (a long clean run behind it)
+          # a single adaptive step is a real maneuver (e.g. the lead starts braking) -- zeroing would
+          # blank the point for SETTLE_CYCLES sweeps exactly when the planner most needs it (and re-blank
+          # it on every subsequent adaptive step of the same braking event). Decay to SETTLE_CYCLES
+          # instead: the base (soft-|vRel|) band keeps emitting, while the graduated high-|vRel| bands
+          # (SETTLE_MID/HIGH) still see a fresh run and keep their protection.
+          mature = self._settle.get(slot, 0) >= BOSCH_RADAR_SETTLE_MATURE
+          self._settle[slot] = BOSCH_RADAR_SETTLE_CYCLES if mature else 0
         else:
           self._settle[slot] = self._settle.get(slot, 0) + 1
       # S5: range_rate is an estimate until the filter has absorbed enough measurements -> NaN before
@@ -598,8 +792,11 @@ class RadarInterface(RadarInterfaceBase):
 
       if slot not in self.pts:
         self.pts[slot] = structs.RadarData.RadarPoint()
-        self.pts[slot].trackId = self._bosch_trackid(slot)
+        # S7: publish under the slot's ASSIGNED id (inherited on a stitch, fresh otherwise) -- no longer
+        # always derivable from (slot, incarnation).
+        self.pts[slot].trackId = self._tid.get(slot, self._bosch_trackid(slot))
         self.pts[slot].yvRel = float('nan')
+        self.pts[slot].vRelNative = float('nan')  # set on slot 0 below when a native Doppler is available
 
       self.pts[slot].dRel = dRel
       # yRel = lateral projection of the polar (range, azimuth) measurement. b4:b5 is AZIMUTH ANGLE
@@ -619,10 +816,36 @@ class RadarInterface(RadarInterfaceBase):
       # headline kinematic (vRel) is derived -- True only once a stable derived vRel exists.
       self.pts[slot].measured = not math.isnan(vRel)
 
+    # Native Doppler exposure (RX-only telemetry; does NOT change vRel/control). Attach the radar's
+    # SELECTED-lead published REL_SPEED (a REAL Doppler) to slot 0's point (the selected lead ~ slot 0,
+    # r=0.84; see the BOSCH_RADAR_SELECTED_MSG block). Gated by a calibration-free velocity-agreement
+    # check so a differently-selected object is not mislabeled. Consumers (radard) fuse it with vision.
+    self._bosch_attach_native_doppler()
+
     # D1: the emit window is consumed; the next window's frames are harvested fresh from vl_all.
     self._pending.clear()
     ret.points = list(self.pts.values())
     return ret
+
+  def _bosch_attach_native_doppler(self):
+    # Set slot 0's vRelNative from 0x2C8 REL_SPEED (the radar's native selected-lead Doppler). RX-only:
+    # never touches vRel/dRel/yRel, so control is unchanged until a consumer opts in. NaN stays on the
+    # point (set at creation) when there is no valid, associated selected lead this cycle.
+    p0 = self.pts.get(0)
+    if p0 is None or self.rcp_sel is None:
+      return
+    sel = self.rcp_sel.vl[BOSCH_RADAR_SELECTED_MSG]  # subscribed -> always present (defaults if unheard)
+    sel_raw = int(sel['SEL_RANGE'])
+    if (int(sel['SEL_STRENGTH']) in BOSCH_RADAR_SEL_STRENGTH_IDLE
+        or sel_raw == BOSCH_RADAR_SEL_RANGE_UNSET or sel_raw >= BOSCH_RADAR_SEL_RANGE_SAT):
+      return  # no selected lead this cycle
+    rel_speed = sel['REL_SPEED']  # native Doppler, m/s (DBC-scaled; zero near raw 124, coarse scale)
+    # Calibration-free association: the native Doppler must agree with slot 0's DERIVED vRel (same
+    # object). Rejects the case where the radar selected a DIFFERENT object than slot 0 (and the
+    # pre-convergence NaN vRel). The small (1-4 m/s) disagreements that matter for false-closing pass.
+    if math.isnan(p0.vRel) or abs(rel_speed - p0.vRel) > BOSCH_RADAR_SEL_VREL_AGREE:
+      return
+    p0.vRelNative = rel_speed
 
   def _update(self, updated_messages):
     # Bosch fine 0x280 track-table radars use the dedicated parser path; dispatch here so the single
