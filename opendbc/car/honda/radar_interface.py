@@ -630,14 +630,26 @@ class RadarInterface(RadarInterfaceBase):
                             'acc': self._acc.get(slot)})  # S8: the departing occupant's OBJ_LIFE
 
   def _bosch_is_swap(self, slot, kf, dRel, y, now):
-    # S7/S7b occupant-swap test (side-effect-free): the slot's new frame is a DIFFERENT object than its
-    # current occupant if the implied range rate is unphysical (the classic BREAK) OR the lateral
+    # S7/S7b/S8 occupant-swap test (side-effect-free): the slot's new frame is a DIFFERENT object than
+    # its current occupant if the implied range rate is unphysical (the classic BREAK), the lateral
     # position jumped far beyond physical sweep-to-sweep motion (same-range, different-lane swap that
-    # range alone cannot see). Gates scale with range (azimuth noise grows with range).
+    # range alone cannot see), OR the hardware OBJ_LIFE counter CONTRADICTS the previous occupant's (a
+    # different object's near-unique seed). The counter trigger closes the geometric blind spot found on
+    # post-deploy drive 2b--2 (t=48.8 s): a same-range occupant swap with a 3.7 m lateral jump at 50 m
+    # sailed under the Y-break gate (2.0+0.06*50 = 5.0 m) and the adjacent-lane car inherited the lead's
+    # trackId -- the on-screen chevron jumped to the wrong car. Gates scale with range (azimuth noise
+    # grows with range).
     dt = (now - kf.t) * 1e-9
     if not (0.0 < dt <= BOSCH_RADAR_VREL_DT_MAX_S):
       return False
     if abs((dRel - kf.r) / dt) > BOSCH_RADAR_VREL_MAX:
+      return True
+    acc_old = self._acc.get(slot)
+    acc_new = self._bosch_obj_life(slot)
+    # acc_new == acc_old means a stale SUB2 read (the counter always advances >=1/sweep for a live
+    # object), NOT a different object -> treat as unavailable rather than break a healthy track.
+    if acc_old and acc_new and acc_new != acc_old and \
+       self._bosch_obj_life_continues(acc_old, acc_new, dt) is False:
       return True
     y_prev = self._last_y.get(slot)
     return (y_prev is not None and not math.isnan(y_prev)

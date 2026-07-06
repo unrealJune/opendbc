@@ -1022,6 +1022,46 @@ class TestS8CounterIdentity(unittest.TestCase):
     self.assertNotEqual(self.ri._tid[0], tid_a2)  # counter vetoed the same-range merge -> fresh identity
     self.assertEqual(len([p for p in rr.points if p.trackId == tid_a2]), 0)
 
+  # ---- in-slot occupant swap (counter as the third _bosch_is_swap trigger) ----------------------
+  def test_counter_breaks_in_slot_occupant_swap(self):
+    # Object A holds slot 0; a DIFFERENT object C takes the SAME slot at nearly the SAME range and
+    # azimuth (post-deploy drive 2b--2: a same-range lane swap under the Y-break gate). Geometry sees a
+    # continuous track; only the counter exposes the swap -> the parser must mint a NEW trackId instead
+    # of letting C inherit A's identity (and A's learned range-rate).
+    raw24 = 7563
+    # control: WITHOUT counters the swap is invisible -> same tid (documents the geometric blind spot)
+    rr = None
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: (raw24, 0)}, with_life=False)
+    tid_before = rr.points[0].trackId
+    rr = self._sweep(self.WARM, {0x280: (raw24 + 20, 0)}, with_life=False)
+    self.assertEqual(self.ri._tid[0], tid_before)
+
+    # WITH counters: C's OBJ_LIFE contradicts A's -> BREAK -> fresh identity
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: (raw24, self.A_BASE + 33 * k)})
+    tid_a = rr.points[0].trackId
+    self._sweep(self.WARM, {0x280: (raw24 + 20, self.C_BASE)})
+    self.assertNotEqual(self.ri._tid[0], tid_a)
+
+  def test_stale_sub2_read_does_not_break(self):
+    # A SUB2 frame lost in one sweep leaves the isolated parser holding the PREVIOUS value (delta 0).
+    # The counter always advances >=1/sweep for a live object, so delta 0 means a stale read, NOT a
+    # different object -> the healthy track must keep its identity.
+    raw24 = 7563
+    rr = None
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: (raw24, self.A_BASE + 33 * k)})
+    tid_a = rr.points[0].trackId
+    # next sweep: header present, SUB2 missing -> rcp_sub still holds last sweep's value
+    rr = self._sweep(self.WARM, {0x280: (raw24 + 20, 0)}, with_life=False)
+    self.assertEqual(self.ri._tid[0], tid_a)
+    pts = [p for p in rr.points]
+    self.assertEqual(len(pts), 1)
+    self.assertEqual(pts[0].trackId, tid_a)
+
 
 if __name__ == "__main__":
   unittest.main()
