@@ -96,20 +96,27 @@ BOSCH_RADAR_SEL_VREL_AGREE = 8.0  # m/s
 #     discriminating segments; pooled Pearson r ~= +0.045). b4:b5 is NOT a free vRel -- vRel stays DERIVED.
 # So yRel is the lateral PROJECTION of the (range, azimuth) polar measurement, computed trigonometrically
 # from dRel and the offset-binary angle -- NOT a linear m/LSB on the raw field:
-#     yRel = -dRel * sin((b4b5 - 0x8000) * LAT_SCALE_DEG_PER_LSB * pi/180)
-# The negative sign (right-of-center b4b5 -> negative yRel) is the rlog-confirmed convention; LAT_RAW is
-# already (b4b5 - 0x8000) per the DBC offset -32768, so it feeds the sin directly.
+#     yRel = +dRel * sin((b4b5 - 0x8000) * LAT_SCALE_DEG_PER_LSB * pi/180)
+# LAT_RAW is already (b4b5 - 0x8000) per the DBC offset -32768, so it feeds the sin directly.
 #
-# SCALE: ~0.0009-0.001 deg/LSB (per-source free fits: joey 0.000902, peter-3d 0.0007-0.00086,
-# peter-49 0.0006). The firmware-static candidate 0.001462 deg/LSB is REJECTED by all three sources
-# (joey nonlinear RMS 1.31 m vs 1.06 m at 0.001; peter-3d pooled R^2 0.215; peter-49 meters-R^2 -29).
-# 0.001 deg/LSB is the shipped value: a clean round figure at the top of the converged band, the explicit
-# recommendation of the two highest-n sources, and it beats 0.001462 decisively. MEDIUM confidence on the
-# third significant figure (0.0007-0.001 residual ambiguity) and the ABSOLUTE boresight zero-offset is
-# still unpinned (a per-mount bias the regression absorbed as a per-segment fixed effect) -- one parked
-# tape-measure read, or the on-road read-only x31 SRAM cross-check in radar-re/azimuth_capture.py, would
-# tighten both. The FIELD IDENTITY (azimuth, not range-rate) is HIGH confidence and settled.
-BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB = 0.001  # deg/LSB; rlog-regressed band 0.0007-0.001, 0.001462 rejected
+# SIGN (fixed 2026-07-06): the ORIGINAL 2026-06-08 sign was a convention error, not a data error. radard
+# expects track yRel == -lead.y (see match prob / lat gate: |c.yRel + lead.y|). The original regression's
+# own correlation was NEGATIVE (peter-3d: r(off, asin(y0/rng)) = -0.965, i.e. vision y ~ -sin(k*raw)),
+# which after the -lead.y convention means yRel must be +dRel*sin(k*raw) -- but the sign was shipped as
+# negative and was UNDETECTABLE on in-path-only drives (yRel ~ 0 either way). The 2026-07 roadtrip
+# (tmp_radar/az_cal2-4.py, 10,439 matched pairs, 1,039 with |y_vis| >= 1 m of real lateral excitation)
+# settles it: candidate shoot-out vs the radard target (-vision_y) gives shipped-sign p90 error 3.04 m
+# vs flipped-sign 0.62 m. The flip also explains the far-range mis-placement that blocked fusion (a track
+# published at +5.1 m when the lead sat at -1.8 m) -- the object was on the CORRECT side all along.
+#
+# SCALE (re-fit 2026-07-06 on the excited pairs, errors-in-variables-bracketed): k = 0.001186 deg/LSB,
+# half-sample CV std 0.000009; per-range bins agree (5-20 m: 0.001201, 20-35 m: 0.001152) -- consistent
+# with the original band's top end (joey 0.000902, peter-3d 0.0007-0.00086) which was attenuated by
+# zero-excitation data. The linear-lateral (m/LSB) alternative model is REJECTED (slope varies 0.31 ->
+# 0.47 mm/LSB across range bins; angle-model slope is range-stable). BORESIGHT: -64 +/- 30 LSB (~0.08
+# deg) -- negligible and unstable, shipped as 0; a parked corner-reflector read (calibration app target
+# mode) can pin it if it ever matters.
+BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB = 0.001186  # deg/LSB; roadtrip excited-pair re-fit, CV std 9e-6
 
 # Staleness gate: if no fresh 0x280 header is seen for this long, clear all points and return an EMPTY
 # RadarData (not None) so radard drops the lead within a cycle (no frozen phantom). RadarPoints carry no
@@ -366,9 +373,10 @@ class _SlotRangeKF:
 
 def _bosch_lat(dRel, cpt):
   # yRel = lateral projection of the polar (range, azimuth) measurement; see the LAT_SCALE block for the
-  # field identity/scale provenance. LAT_RAW is already offset-binary-centered per the DBC.
+  # field identity/scale/SIGN provenance (positive sign = radard's -lead.y convention; fixed 2026-07-06).
+  # LAT_RAW is already offset-binary-centered per the DBC.
   az_deg = cpt['LAT_RAW'] * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB
-  return -dRel * sin(az_deg * pi / 180.0)
+  return dRel * sin(az_deg * pi / 180.0)
 
 
 def _create_bosch_can_parser(CP):

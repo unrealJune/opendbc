@@ -297,19 +297,20 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertAlmostEqual(p.vRel, rate, delta=1.5)  # KF converged to the steady closing rate
 
   def test_yrel_azimuth_formula_and_sign(self):
-    # b4:b5 = AZIMUTH (rlog-settled 2026-06-08). yRel is the polar->cartesian projection:
-    #   yRel = -dRel * sin((b4b5 - 0x8000) * scale_deg * pi/180)
-    # NOT a linear m/LSB. Right-of-center (LAT_RAW > 0) -> negative yRel.
-    rr = self._warm(3999, lat_raw=0x9000)  # lat_raw > center -> right; born under S2
+    # b4:b5 = AZIMUTH (rlog-settled 2026-06-08; SIGN corrected 2026-07-06 by the roadtrip excited-pair
+    # regression -- radard's yRel convention is -lead.y, and vision y ~ -sin(k*raw), so the projection is
+    # POSITIVE):  yRel = +dRel * sin((b4b5 - 0x8000) * scale_deg * pi/180)
+    # NOT a linear m/LSB. LAT_RAW > 0 -> positive yRel.
+    rr = self._warm(3999, lat_raw=0x9000)  # lat_raw > center; born under S2
     p = rr.points[0]
     lat = 0x9000 - 0x8000  # = +4096 LSB
     dRel = 0.00357 * 3999 - 3.0
     az_deg = lat * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB
-    expected = -dRel * math.sin(az_deg * math.pi / 180.0)
+    expected = dRel * math.sin(az_deg * math.pi / 180.0)
     self.assertAlmostEqual(p.yRel, expected, places=6)
-    self.assertLess(p.yRel, 0.0)  # right of center -> negative y
-    # And it is the trig projection, NOT the old linear -LAT_RAW*scale (the two differ once dRel != 1):
-    self.assertNotAlmostEqual(p.yRel, -lat * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB, places=6)
+    self.assertGreater(p.yRel, 0.0)  # positive LAT_RAW -> positive yRel (radard -lead.y convention)
+    # And it is the trig projection, NOT a linear LAT_RAW*scale (the two differ once dRel != 1):
+    self.assertNotAlmostEqual(p.yRel, lat * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB, places=6)
 
   def test_yrel_center_is_zero(self):
     # Exactly centered azimuth (LAT_RAW == 0) -> yRel == 0 regardless of range.
@@ -317,14 +318,14 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertAlmostEqual(rr.points[0].yRel, 0.0, places=9)
 
   def test_yrel_left_positive(self):
-    # Left-of-center (LAT_RAW < 0) -> positive yRel (sign symmetry of the projection).
-    rr = self._warm(3999, lat_raw=0x7000)  # below center -> left
+    # LAT_RAW < center -> negative yRel (sign symmetry of the projection; convention fixed 2026-07-06).
+    rr = self._warm(3999, lat_raw=0x7000)  # below center
     p = rr.points[0]
-    self.assertGreater(p.yRel, 0.0)
-    # magnitude matches the right-side case at the same offset magnitude
+    self.assertLess(p.yRel, 0.0)
+    # magnitude matches the opposite-side case at the same offset magnitude
     dRel = 0.00357 * 3999 - 3.0
     az_deg = (0x7000 - 0x8000) * BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB
-    self.assertAlmostEqual(p.yRel, -dRel * math.sin(az_deg * math.pi / 180.0), places=6)
+    self.assertAlmostEqual(p.yRel, dRel * math.sin(az_deg * math.pi / 180.0), places=6)
 
   def test_yrel_scales_with_range(self):
     # AZIMUTH signature: at a FIXED angle, the lateral projection grows with range (a linear m/LSB
