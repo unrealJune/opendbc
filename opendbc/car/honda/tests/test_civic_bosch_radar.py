@@ -35,6 +35,7 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_VREL_DT_MAX_S,
   BOSCH_RADAR_SELECTED_MSG,
   BOSCH_RADAR_SEL_VREL_AGREE,
+  BOSCH_RADAR_GHOST_LAT_MAX,
   BOSCH_RADAR_STITCH_RANGE_GATE,
   BOSCH_RADAR_STITCH_RANGE_GATE_LIFE,
   BOSCH_RADAR_OBJ_LIFE_STEP_MAX,
@@ -234,6 +235,55 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertAlmostEqual(p_no.dRel, p_yes.dRel, places=6)
     self.assertTrue(math.isnan(p_no.vRelNative))
     self.assertFalse(math.isnan(p_yes.vRelNative))
+
+  # ---- S9 in-lane closer-ghost veto (selected-lead Doppler contradicts a fine track's closing) --------
+  def _warm_closing_with_sel(self, step, rel_speed_raw, *, lat_raw=0x8000, feed_sel=True, **sel_kw):
+    # Drive slot 0 CLOSING (range shrinks `step` raw/cycle -> vRel = -0.00357*step/0.05 m/s) for
+    # WARM_CYCLES+1 sweeps so it is born + settled + converged, optionally feeding a 0x2C8 selected-lead
+    # frame each sweep. Returns the last rr. Used to exercise the S9 veto and its safety gates.
+    dt_ns = int(0.05 * 1e9)
+    rr = None
+    for k in range(self.WARM_CYCLES + 1):
+      cntr = (0x10 + k) & 0xFF
+      body = [self._f(0x280, _hdr_frame(4000 - step * k, lat_raw=lat_raw, cntr=cntr))]
+      if feed_sel:
+        body.append(self._sel_frame(rel_speed_raw, cntr=cntr, **sel_kw))
+      rr = self._emit(k * dt_ns, body, cntr)
+    return rr
+
+  def test_s9_vetoes_in_lane_ghost_closing_the_doppler_denies(self):
+    # An in-lane slot closing hard (~-7 m/s) while the radar's OWN selected-lead Doppler reads ~0 closing
+    # (raw 124) is an in-lane closer GHOST -> the point is dropped so radard falls back to vision.
+    rr = self._warm_closing_with_sel(100, 124)
+    self.assertEqual(len(rr.points), 0, "in-lane ghost the selected Doppler denies must be vetoed")
+
+  def test_s9_keeps_closing_the_doppler_confirms(self):
+    # Same in-lane closing, but now the selected-lead Doppler ALSO reports the closing (raw ~134 -> ~-7
+    # m/s). The radar's own target agrees -> this is a real closing and the point is KEPT (no veto).
+    raw = int(round((-7.0 - 86.5) / -0.7))  # REL_SPEED ~ -7 m/s
+    rr = self._warm_closing_with_sel(100, raw)
+    self.assertEqual(len(rr.points), 1, "a closing the selected Doppler confirms must NOT be vetoed")
+    self.assertLess(rr.points[0].vRel, 0.0)
+
+  def test_s9_no_veto_without_selected_lead(self):
+    # No valid selected-lead Doppler this cycle -> the veto is Doppler-gated OFF (a missing 0x2C8 can never
+    # suppress a real fine track). The same in-lane closing point is kept.
+    rr = self._warm_closing_with_sel(100, 124, feed_sel=False)
+    self.assertEqual(len(rr.points), 1, "no selected lead -> no veto (Doppler-gated)")
+
+  def test_s9_no_veto_out_of_lane(self):
+    # An OUT-OF-LANE closing track (|yRel| > GHOST_LAT_MAX) is not a ghost of the followed lead -> not
+    # vetoed even when the selected Doppler reads ~0 (a real adjacent-lane closer must survive).
+    rr = self._warm_closing_with_sel(100, 124, lat_raw=0xA000)  # ~9.7 deg -> |yRel| ~1.5 m > GHOST_LAT_MAX
+    self.assertEqual(len(rr.points), 1, "out-of-lane closing point must not be vetoed by S9")
+    self.assertGreater(abs(rr.points[0].yRel), BOSCH_RADAR_GHOST_LAT_MAX)
+
+  def test_s9_veto_boundary_respects_margin(self):
+    # Just-inside the margin (closing only ~1.0 m/s more than the Doppler) is NOT vetoed; well past it is.
+    raw_zero = 124  # Doppler ~0
+    # slot closing ~ -1.0 m/s (step ~ 14): -1.0 vs Doppler ~-0.3 -> diff ~0.7 < margin 1.5 -> KEEP
+    rr_near = self._warm_closing_with_sel(14, raw_zero)
+    self.assertEqual(len(rr_near.points), 1, "closing within GHOST_DOP_MARGIN of the Doppler is kept")
 
   def test_b1_tag_gate_skips_nonheader(self):
     # b1 != 0x74 -> non-range sub-frame -> skipped (no point), even with a plausible range field.

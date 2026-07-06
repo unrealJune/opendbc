@@ -85,6 +85,27 @@ BOSCH_RADAR_SEL_RANGE_SAT = 0xFF80
 # about are 1-4 m/s; this only rejects gross wrong-object mismatches (and NaN slot0 vRel).
 BOSCH_RADAR_SEL_VREL_AGREE = 8.0  # m/s
 
+# S9 -- IN-LANE CLOSER-GHOST veto using the radar's OWN selected-lead Doppler (2026-07-06). Dissecting the
+# 9 engaged hard-decel events on the post-deploy drives (tmp_radar/dissect_phantom.py) showed the dominant
+# phantom mechanism is NOT vRel ringing (steady KF ring is only ~0.2 m/s) but a same-lane CLOSER GHOST:
+# 5/9 events fuse a fine 0x280 track 3-6 m closer than the confident vision lead, ~0 lateral disagreement
+# (so NOT an adjacent-lane / azimuth issue), and the radard lead-KF turns the ghost's motion into ~2.3
+# m/s^2 of phantom lead-decel. The tell: the radar's OWN selected-lead (ACC target) Doppler 0x2C8 reports
+# the CORRECT ~0 closing (matches vision 89-97% of frames) through these events -- the radar's target pick
+# knows the truth while a spurious fine-table return invents the closer ghost. The deployed slot0-only
+# vRelNative guard is blind here (vRelNative NaN on the fused point in 64% of ghost frames), so the veto
+# must use the RAW per-cycle selected-lead Doppler, available to every slot. VETO: suppress a converged,
+# IN-LANE (|yRel| < GHOST_LAT_MAX) point whose DERIVED closing over-claims the selected-lead Doppler by
+# more than GHOST_DOP_MARGIN -> the radar's own ACC pick contradicts this fine track, so it is a
+# ghost/multipath/staircase artifact; drop it this cycle and radard falls back to vision (which sees no
+# such closing). Asymmetric (only ever drops OVER-closing points) and Doppler-gated (no valid selected
+# lead -> no veto), so a real closing the Doppler CONFIRMS (incl. one vision is blind to) is always kept.
+# Validated end-to-end (tmp_radar/compare3.py, real parser -> radard) ON TOP of the deployed evidence
+# clamp: phantom hard-decel events 2/9 -> 0/9, false-closing 109 -> 67, and the under-reported-real-closing
+# safety metric IMPROVED 259 -> 196; cost is ~4% radar-fused coverage (ghost frames falling back to vision).
+BOSCH_RADAR_GHOST_DOP_MARGIN = 1.5  # m/s; in-lane |derived closing| exceeding the selected Doppler by this
+BOSCH_RADAR_GHOST_LAT_MAX = 1.2     # m; only veto near-in-lane points (a ghost of the followed lead)
+
 # b4:b5 FIELD IDENTITY = AZIMUTH ANGLE (offset-binary, center 0x8000), NOT range-rate.
 # SETTLED 2026-06-08 by a three-source rlog regression against the vision-model lead (no flash, no TX,
 # no Ghidra, no controlled/tape capture) -- radar-re/latscale/_rlog/{peter-3d,peter-49,joey}.md and
@@ -852,6 +873,9 @@ class RadarInterface(RadarInterfaceBase):
       live_frames[slot] = cpt
 
     # ---- pass B: birth/stitch/KF-update/emit per live slot ----------------------------------------
+    # S9: the radar's selected-lead (ACC target) Doppler this cycle -- a per-cycle scalar used to veto
+    # in-lane closer ghosts below. Read once (raw, RX-only); NaN when there is no valid selected lead.
+    sel_dop = self._bosch_selected_doppler()
     for slot, cpt in live_frames.items():
       dRel = cpt['RANGE']
       # S7b: this frame's lateral position, computed up front for swap detection + stitch gating (it is
@@ -972,6 +996,16 @@ class RadarInterface(RadarInterfaceBase):
         self.pts.pop(slot, None)
         continue
 
+      # S9 in-lane closer-ghost veto: an IN-LANE point whose DERIVED closing over-claims the radar's own
+      # selected-lead (ACC target) Doppler by more than the margin is a same-lane ghost/multipath/staircase
+      # artifact (the radar's own target pick sees no such closing) -> drop it this cycle so radard falls
+      # back to vision. Doppler-gated (skipped when no valid selected lead) and asymmetric (only OVER-closing
+      # points), so a real closing the Doppler CONFIRMS -- including one vision is blind to -- is kept.
+      if (not math.isnan(sel_dop) and abs(yRel) < BOSCH_RADAR_GHOST_LAT_MAX
+          and vRel < sel_dop - BOSCH_RADAR_GHOST_DOP_MARGIN):
+        self.pts.pop(slot, None)
+        continue
+
       if slot not in self.pts:
         self.pts[slot] = structs.RadarData.RadarPoint()
         # S7: publish under the slot's ASSIGNED id (inherited on a stitch, fresh otherwise) -- no longer
@@ -1008,19 +1042,30 @@ class RadarInterface(RadarInterfaceBase):
     ret.points = list(self.pts.values())
     return ret
 
+  def _bosch_selected_doppler(self) -> float:
+    """The radar's valid selected-lead (ACC target) native Doppler (0x2C8 REL_SPEED) this cycle, or NaN.
+    RX parser only (self.rcp_sel is isolated) -- its validity NEVER gates radar health; an unheard / idle /
+    sentinel selected frame yields NaN. This is a per-cycle scalar available to EVERY slot (unlike the
+    slot0-attached vRelNative). Shared by the S9 in-lane ghost veto and the vRelNative exposure below."""
+    if self.rcp_sel is None:
+      return float('nan')
+    sel = self.rcp_sel.vl[BOSCH_RADAR_SELECTED_MSG]  # subscribed -> always present (defaults if unheard)
+    sel_raw = int(sel['SEL_RANGE'])
+    if (int(sel['SEL_STRENGTH']) in BOSCH_RADAR_SEL_STRENGTH_IDLE
+        or sel_raw == BOSCH_RADAR_SEL_RANGE_UNSET or sel_raw >= BOSCH_RADAR_SEL_RANGE_SAT):
+      return float('nan')  # no selected lead this cycle
+    return float(sel['REL_SPEED'])  # native Doppler, m/s (DBC-scaled; zero near raw 124, coarse scale)
+
   def _bosch_attach_native_doppler(self):
     # Set slot 0's vRelNative from 0x2C8 REL_SPEED (the radar's native selected-lead Doppler). RX-only:
     # never touches vRel/dRel/yRel, so control is unchanged until a consumer opts in. NaN stays on the
     # point (set at creation) when there is no valid, associated selected lead this cycle.
     p0 = self.pts.get(0)
-    if p0 is None or self.rcp_sel is None:
+    if p0 is None:
       return
-    sel = self.rcp_sel.vl[BOSCH_RADAR_SELECTED_MSG]  # subscribed -> always present (defaults if unheard)
-    sel_raw = int(sel['SEL_RANGE'])
-    if (int(sel['SEL_STRENGTH']) in BOSCH_RADAR_SEL_STRENGTH_IDLE
-        or sel_raw == BOSCH_RADAR_SEL_RANGE_UNSET or sel_raw >= BOSCH_RADAR_SEL_RANGE_SAT):
-      return  # no selected lead this cycle
-    rel_speed = sel['REL_SPEED']  # native Doppler, m/s (DBC-scaled; zero near raw 124, coarse scale)
+    rel_speed = self._bosch_selected_doppler()
+    if math.isnan(rel_speed):
+      return
     # Calibration-free association: the native Doppler must agree with slot 0's DERIVED vRel (same
     # object). Rejects the case where the radar selected a DIFFERENT object than slot 0 (and the
     # pre-convergence NaN vRel). The small (1-4 m/s) disagreements that matter for false-closing pass.
