@@ -122,8 +122,30 @@ BO_ 641 RADAR_TRACK_0_SUB1: 8 RADAR
  SG_ SUB_CNTR : 63|8@0+ (1,0) [0|255] "" XXX
 
 BO_ 642 RADAR_TRACK_0_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
  SG_ VREL_PROXY : 23|16@0+ (1,0) [0|65535] "" XXX
  SG_ SUB_CNTR : 63|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 646 RADAR_TRACK_1_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 650 RADAR_TRACK_2_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 654 RADAR_TRACK_3_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 722 RADAR_TRACK_4_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 726 RADAR_TRACK_5_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 730 RADAR_TRACK_6_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 734 RADAR_TRACK_7_SUB2: 8 RADAR
+ SG_ OBJ_LIFE : 7|16@0+ (1,0) [0|65535] "" XXX
 
 
 CM_ "Stock 36802-TBA Bosch radar FINE per-track object table. Big-endian (Motorola), all frames DLC8. The radar broadcasts up to 8 track records, each a 4-frame burst on consecutive IDs; only the HEADER ID of each record (0x280/0x284/0x288/0x28C/0x2D0/0x2D4/0x2D8/0x2DC, a near group 0x280-0x28C + a far group 0x2D0-0x2DC) carries RANGE, and only on the sub-frame where B1 in {0x74 moving, 0x94 stationary} (the range-carrier header tags). The other 3 sub-frames of each record (0x281-0x283, 0x285-0x287, 0x2D1-0x2D3, ...) carry lateral/velocity/status and would decode to spurious sub-zero range -- they are NOT read as range by the parser. NOTE 2026-07-01: slot 0's sub-frames 0x281/0x282 are now DECLARED (RADAR_TRACK_0_SUB1/SUB2) as RX-only REFERENCE signals (AMPLITUDE, VREL_PROXY) documenting a data-mining pass -- they are still NOT parsed into lead points; see their BO_ comments. 0x281.B2:B3 AMPLITUDE is a clean inverse-range return strength (r=-0.76 vs range) usable as a soft real-vs-clutter weight; 0x282.B2:B3 VREL_PROXY correlates -0.63 with the track's own range-rate but is NOT cleanly calibrated (redundant with the parser's KF-derived vRel). NOTE 2026-07-01: slots 0x288/0x28C were previously undeclared (a 6-slot list) and are actually the busiest MID-range slots (~62 m); the old list instead polled the near-dead far slots. Reading all 8 is the correct full-table decode -- but an offline replay of both phantom-fix drives showed it is NEUTRAL for the 40-70 m follow-too-far/false-closing symptom (only ~8% of the added points are the lead; that symptom is a radard fusion issue -- see tmp_radar/RADARD_HANDOFF.md and the BO_ 648 comment). The parser GATES on TRACK_TAG(B1) in {0x74,0x94}. Sentinels (any one -> not an active track): STRENGTH(B0)==0xFE (idle), RANGE_RAW(B2:B3)==0x8000 (~114m unset), RANGE_RAW>=0xFF80 (~230m saturation rail). RANGE and RANGE_RAW intentionally overlap B2:B3 (scaled meters vs raw int for the sentinel test) -- opendbc decodes overlapping signals independently. RANGE scale/offset (0.00357, -3.0) is cross-car-validated; the offset -3.0 is tape-anchored. LAT_RAW is offset-binary (raw 0x8000 = center, declared with offset -32768); its physical m/LSB is NOT pinned, so the parser applies a clearly-placeholdered LAT_SCALE and yRel magnitude is DO_NOT_TRUST until a controlled lateral cal. vRel is NOT published by the radar on the FINE 0x280 frames; the parser derives it as d(dRel)/dt per track. 0x2C8/0x2C9 (RADAR_SELECTED) remain declared as a coarse, RX-only reference and are NOT read by the fine parser; their byte layout was RE-DERIVED 2026-06-30 against the clean vision lead (see BO_ 712 comment) -- the prior LONG_DIST@B0:B1 / REL_SPEED@(0.25,-31.25) layout was WRONG. REL_SPEED is the byte-6 coarse relative velocity, now CALIBRATED (vRel = -0.7*(B6-124) m/s, r=0.90 vs vision).";
@@ -136,9 +158,10 @@ CM_ BO_ 724 "Track slot 5 header (record 0x2D4-0x2D7). Far-group slot (valid ~1%
 CM_ BO_ 728 "Track slot 6 header (record 0x2D8-0x2DB). Far-group slot (rarely valid).";
 CM_ BO_ 732 "Track slot 7 header (record 0x2DC-0x2DF). Sweep terminator; the parser's trigger_msg (S4 sweep-coherent emit). Stays LAST in the sweep so adding slots 2/3 does not disturb trigger coherence.";
 CM_ BO_ 641 "RADAR_TRACK_0_SUB1 (0x281): sub-frame 1 of slot 0's 4-frame record. RX-only REFERENCE, NOT parsed into lead points. AMPLITUDE (B2:B3) is a clean inverse-range return strength (mined 2026-07-01, r=-0.76 vs range; range-bin means 10430->1081 over 0-150 m). Range-normalized it is a soft real-vs-clutter weight (bright-for-range tracks ~3x more likely the true lead, AUC 0.60) -- but does NOT separate the closer-clutter that drives false-closing (that clutter is bright too), so it is a soft radard input, not a standalone gate. The same sub-frame layout repeats per slot (0x285, 0x289, ...).";
-CM_ BO_ 642 "RADAR_TRACK_0_SUB2 (0x282): sub-frame 2 of slot 0's 4-frame record. RX-only REFERENCE, NOT parsed. VREL_PROXY (B2:B3) correlates -0.63 with the track's OWN range-rate (mined 2026-07-01, once track-swap jumps are rejected) but is NOT cleanly calibrated (per-slot scale disagrees ~5x, integral test fails) -- a noisy velocity-correlate, redundant with the parser's KF-derived vRel, kept only as documentation. The same layout repeats per slot (0x286, 0x28A, ...).";
+CM_ BO_ 642 "RADAR_TRACK_0_SUB2 (0x282): sub-frame 2 of slot 0's 4-frame record. OBJ_LIFE (B0:B1) is the radar's per-object identity/lifetime accumulator -- see its SG comment. VREL_PROXY (B2:B3) correlates -0.63 with the track's OWN range-rate (mined 2026-07-01, once track-swap jumps are rejected) but is NOT cleanly calibrated (per-slot scale disagrees ~5x, integral test fails) -- a noisy velocity-correlate, redundant with the parser's KF-derived vRel, kept only as documentation. The same layout repeats per slot (0x286, 0x28A, 0x28E, 0x2D2, 0x2D6, 0x2DA, 0x2DE = each header+2), now all DECLARED (RADAR_TRACK_1..7_SUB2) so the parser's isolated SUB2 parser can read OBJ_LIFE for every slot.";
 CM_ SG_ 641 AMPLITUDE "B2:B3 BE16 raw. Inverse-range return strength / RCS-like amplitude (falls monotonically with range). Soft real-vs-clutter weight after range-normalization; reference only.";
 CM_ SG_ 642 VREL_PROXY "B2:B3 BE16 raw. Correlates with the track's own range-rate (-0.63) but not a calibrated Doppler; reference only.";
+CM_ SG_ 642 OBJ_LIFE "B0:B1 BE16. The radar's own per-object identity / lifetime accumulator. Ticks +33 per sweep for a continuously-tracked object (deterministic internal sub-counter steps of +17 ~6% / +1 ~2%; NEVER decreases for the same object) and carries a near-unique per-object seed so two SIMULTANEOUS objects collide only 0.2% of the time (spread median ~8448 over live slots). It is the radar's internal track id, which the parser's range/azimuth stitch (S7/S7b) only approximates. VALIDATED 2026-07-06 (tmp_radar/id_perobject.py, id_predicate.py; 6 highway/traffic segments): per-object not a global clock (99.8% discrimination), and over a re-slot gap the SAME object's value advances by (now-old) mod 2^16 in [1, 33*n + 6] for n sweeps -- the S8 continuity predicate. Present on EVERY slot's SUB2 (header+2). On an EMPTY/sentinel slot OBJ_LIFE is a high-rail sentinel (~0xFFF0-0xFFFF), so the parser only reads it for slots with a live range-carrier (never gates on the raw value; a real counter can sit in that range just before its 16-bit wrap). RX-only via an ISOLATED parser: a missing SUB2 frame never affects can_valid; the stitch then falls back to pure S7/S7b geometry. The same layout repeats per slot.";
 CM_ SG_ 640 STRENGTH "B0 raw, unscaled. Co-varies with range (return strength, not a flag). Used as the idle sentinel (==0xFE -> no track).";
 CM_ SG_ 640 TRACK_TAG "B1 raw. The range-carrier header tag. Parser GATES on ==0x74; any other value is a non-range sub-frame mux'd onto this ID -> SKIP (do not read RANGE).";
 CM_ SG_ 640 RANGE "B2:B3 BE16 -> meters. range = 0.00357*raw - 3.0. Scale cross-car-validated (corpus median 0.00357, R^2=0.975 vs fused dRel); offset -3.0 tape-anchored. 16-bit int, no float / no SIG_VALTYPE_ -- the parser consumes meters directly.";

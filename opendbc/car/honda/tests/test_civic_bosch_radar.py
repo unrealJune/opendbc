@@ -35,6 +35,9 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_VREL_DT_MAX_S,
   BOSCH_RADAR_SELECTED_MSG,
   BOSCH_RADAR_SEL_VREL_AGREE,
+  BOSCH_RADAR_STITCH_RANGE_GATE,
+  BOSCH_RADAR_STITCH_RANGE_GATE_LIFE,
+  BOSCH_RADAR_OBJ_LIFE_STEP_MAX,
 )
 from opendbc.car.honda.values import CAR, DBC
 
@@ -209,7 +212,7 @@ class TestCivicBoschFineParser(unittest.TestCase):
     # Selected-lead Doppler implying a large closing speed while slot 0 is steady (vRel~0) -> the
     # association check (|REL_SPEED - vRel| < AGREE) rejects it (different object) -> vRelNative NaN.
     raw_fast = int(round((-20.0 - 86.5) / -0.7))  # REL_SPEED ~ -20 m/s (hard closing), |diff| >> AGREE
-    self.assertGreater(abs((-0.7 * raw_fast + 86.5)), BOSCH_RADAR_SEL_VREL_AGREE)
+    self.assertGreater(abs(-0.7 * raw_fast + 86.5), BOSCH_RADAR_SEL_VREL_AGREE)
     rr = self._warm_with_sel(3999, raw_fast)
     self.assertTrue(math.isnan(rr.points[0].vRelNative))
 
@@ -895,6 +898,129 @@ class TestS7CrossSlotStitch(unittest.TestCase):
     self.assertTrue(self.ri._kf[0].adapted)
     self.assertEqual(self.ri._settle[0], 0)
     self.assertEqual(len(rr.points), 0)  # withheld while it re-proves itself
+
+
+class TestS8CounterIdentity(unittest.TestCase):
+  """S8: the radar's HARDWARE per-object counter OBJ_LIFE (B0:B1 of each slot's SUB2 frame, header+2) is
+  read via an isolated parser and used as a stitch corroborator / veto / recovery on top of S7/S7b.
+  These drive real SUB2 frames end-to-end (DBC decode + isolated parser + graveyard stitch)."""
+
+  TRIG = 0x2DC
+  DT_NS = int(0.05 * 1e9)
+  WARM = BOSCH_RADAR_BORN_CYCLES + BOSCH_RADAR_SETTLE_CYCLES + 2
+  A_BASE, B_BASE, C_BASE = 5000, 20000, 40000  # per-object OBJ_LIFE seeds (far apart -> distinct ids)
+
+  def setUp(self):
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+
+  def _f(self, addr, frame):
+    return (addr, frame, self.bus)
+
+  def _trig(self, cntr):
+    return self._f(self.TRIG, _hdr_frame(0x8000, tag=0xF0, strength=0xFE, cntr=cntr))
+
+  def _sub2(self, hdr_addr, life):
+    # SUB2 frame (header+2) carrying OBJ_LIFE at B0:B1 (the rest is don't-care for this decode).
+    return self._f(hdr_addr + 2, _frame((life >> 8) & 0xFF, life & 0xFF, 0, 0, 0, 0, 0, 0))
+
+  def _sweep(self, k, specs, *, with_life=True, cntr0=0x10):
+    # One sweep at cycle k. specs = {hdr_addr: (range_raw, life)}. Sends header + (optional) SUB2 +
+    # trigger. with_life=False omits the SUB2 frames -> OBJ_LIFE unavailable (pure S7/S7b geometry).
+    cntr = (cntr0 + k) & 0xFF
+    body = []
+    for a, (rr, life) in specs.items():
+      body.append(self._f(a, _hdr_frame(rr, cntr=cntr)))
+      if with_life:
+        body.append(self._sub2(a, life))
+    return self.ri.update(_can(k * self.DT_NS, body + [self._trig(cntr)]))
+
+  # ---- direct predicate + decode ---------------------------------------------------------------
+  def test_predicate_bounds(self):
+    f = RadarInterface._bosch_obj_life_continues
+    self.assertTrue(f(1000, 1000 + BOSCH_RADAR_OBJ_LIFE_STEP_MAX, 0.06))  # +33 one sweep -> continues
+    self.assertTrue(f(1000, 1017, 0.06))                                  # +17 sub-counter step -> continues
+    self.assertTrue(f(1000, 1001, 0.06))                                  # +1 sub-counter wrap -> continues
+    self.assertTrue(f(1000, 1000 + BOSCH_RADAR_OBJ_LIFE_STEP_MAX * 6, 0.30))  # 6-sweep gap, all +33
+    self.assertFalse(f(1000, 1000, 0.06))       # frozen (no advance) -> not a live continuation
+    self.assertFalse(f(1000, 990, 0.06))        # DECREASE -> different object
+    self.assertFalse(f(1000, 9000, 0.06))       # huge jump -> different object
+    self.assertFalse(f(1000, 1066, 0.04))       # +66 in a single-sweep gap (n=1) -> advanced too far
+    self.assertIsNone(f(0, 1033, 0.06))         # unavailable (unheard default) -> caller uses geometry
+    self.assertIsNone(f(1000, 0, 0.06))
+    # 16-bit modular wrap: an object near the rail advances correctly across the 2^16 boundary
+    self.assertTrue(f(65530, (65530 + 33) & 0xFFFF, 0.06))
+
+  def test_obj_life_decoded_and_stored_per_slot(self):
+    # A live slot's OBJ_LIFE is decoded from its SUB2 frame and stored in _acc (keyed by slot), so a later
+    # graveyard stitch can match this object by its hardware id. RX-only: the point's vRel/dRel are set by
+    # the header frame, not the SUB2 frame.
+    life = self.A_BASE
+    rr = None
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x280: (3999, life + 33 * k)})
+    self.assertEqual(len(rr.points), 1)
+    self.assertEqual(self.ri._acc[0], life + 33 * (self.WARM - 1))  # last live frame's counter
+    self.assertAlmostEqual(rr.points[0].dRel, 0.00357 * 3999 - 3.0, places=4)  # header-driven, unaffected
+
+  # ---- cross-slot recovery (counter continues where the tight range gate misses) ----------------
+  def _warm_two(self, with_life):
+    # Warm object A in slot 1 (0x284, ~24 m) and object B in slot 2 (0x288, ~36 m) to emitting.
+    raw24, raw36 = 7563, 10924
+    rr = None
+    for k in range(self.WARM):
+      rr = self._sweep(k, {0x284: (raw24, self.A_BASE + 33 * k),
+                           0x288: (raw36, self.B_BASE + 33 * k)}, with_life=with_life)
+    ids = {round(p.dRel): p.trackId for p in rr.points}
+    return rr, ids
+
+  def test_cross_slot_recovery_beyond_geometry_gate(self):
+    # A (slot 1, 24 m) re-slots to slot 0 but its range shifts 3 m (RES beyond the 2 m geometric gate,
+    # inside the 5 m counter-confirmed gate). WITH the counter it is RECOVERED (same trackId, emits with
+    # no hole); WITHOUT the counter pure geometry misses it (fresh trackId).
+    self.assertGreater(3.0, BOSCH_RADAR_STITCH_RANGE_GATE)
+    self.assertLess(3.0, BOSCH_RADAR_STITCH_RANGE_GATE_LIFE)
+    raw27, raw36 = 8403, 10924  # 27 m (A shifted +3 m), 36 m (B)
+
+    # WITH counter -> recovered
+    rr, ids = self._warm_two(with_life=True)
+    tid_a = ids[24]
+    rr = self._sweep(self.WARM, {0x280: (raw27, self.A_BASE + 33 * self.WARM),
+                                 0x284: (raw36, self.B_BASE + 33 * self.WARM)}, with_life=True)
+    pts27 = [p for p in rr.points if abs(p.dRel - 27.0) < 0.6]
+    self.assertEqual(len(pts27), 1)               # no emit hole (inherited settle/valid_cnt)
+    self.assertEqual(pts27[0].trackId, tid_a)     # SAME identity recovered across the re-slot
+
+    # WITHOUT counter -> pure geometry misses the 3 m shift
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+    rr, ids = self._warm_two(with_life=False)
+    tid_a2 = ids[24]
+    self._sweep(self.WARM, {0x280: (raw27, 0), 0x284: (raw36, 0)}, with_life=False)
+    self.assertNotEqual(self.ri._tid[0], tid_a2)  # geometry alone: fresh identity (the miss S8 recovers)
+
+  def test_counter_vetoes_same_range_different_object(self):
+    # A (slot 1, 24 m) is displaced; a DIFFERENT object C takes slot 0 at the SAME 24 m range (RES ~0,
+    # inside the geometric gate). WITHOUT the counter geometry wrongly STITCHES C onto A's identity;
+    # WITH the counter C's non-continuing OBJ_LIFE VETOES the stitch -> C gets a fresh identity.
+    raw24, raw36 = 7563, 10924
+
+    # WITHOUT counter -> geometry wrongly merges (control)
+    rr, ids = self._warm_two(with_life=False)
+    tid_a = ids[24]
+    self._sweep(self.WARM, {0x280: (raw24, 0), 0x284: (raw36, 0)}, with_life=False)
+    self.assertEqual(self.ri._tid[0], tid_a)      # geometry alone: C inherits A's id (the wrong merge)
+
+    # WITH counter -> vetoed
+    self.ri = _make_ri()
+    self.bus = self.ri.rcp.bus
+    rr, ids = self._warm_two(with_life=True)
+    tid_a2 = ids[24]
+    # slot 0 gets 24 m but with object C's counter (does NOT continue A's) -> veto
+    rr = self._sweep(self.WARM, {0x280: (raw24, self.C_BASE),
+                                 0x284: (raw36, self.B_BASE + 33 * self.WARM)}, with_life=True)
+    self.assertNotEqual(self.ri._tid[0], tid_a2)  # counter vetoed the same-range merge -> fresh identity
+    self.assertEqual(len([p for p in rr.points if p.trackId == tid_a2]), 0)
 
 
 if __name__ == "__main__":

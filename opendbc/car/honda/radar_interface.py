@@ -223,6 +223,35 @@ BOSCH_RADAR_Y_BREAK_SCALE = 0.06      # m of extra gate per meter of range
 BOSCH_RADAR_STITCH_Y_GATE_BASE = 1.5  # m; lateral continuity gate for stitching
 BOSCH_RADAR_STITCH_Y_GATE_SCALE = 0.05
 
+# S8 -- HARDWARE per-object identity from the fine-track SUB2 sub-frame OBJ_LIFE (B0:B1 of header+2:
+# 0x282/0x286/0x28A/0x28E/0x2D2/0x2D6/0x2DA/0x2DE). Mined + validated 2026-07-06 (tmp_radar/id_perobject.py,
+# id_predicate.py on trip_fusion.pkl, 6 highway/traffic segments): OBJ_LIFE is the radar's OWN per-object
+# lifetime accumulator -- it ticks +33 per sweep for a continuously-tracked object (deterministic internal
+# sub-counter steps of +17 ~6% / +1 ~2%, NEVER a same-object decrease) on top of a near-unique per-object
+# seed, so two SIMULTANEOUS objects collide only 0.2% of the time (spread median ~8448 over live slots).
+# It is the radar's internal track id, which the range/azimuth stitch (S7/S7b) only APPROXIMATES.
+# Used here as a stitch corroborator / VETO + missed-stitch recovery ON TOP of the geometric gates (NOT a
+# standalone id: 2.56% of nearest-other-object counter gaps fall inside the <=6-sweep continuity reach, so
+# range/azimuth still gate). Measured vs the parser's replay-validated identities: 95.6% of S7 stitches are
+# counter-corroborated, 90.9% of BREAKs counter-confirmed, and 245/442 fresh trackIds are actually the same
+# physical object the geometry MISSED (counter-continuous + range-plausible) -> recoverable churn.
+# RX-only: read via an ISOLATED parser (rcp_sub) so a missing SUB2 frame can NEVER affect can_valid / fault
+# logic; when OBJ_LIFE is unavailable the stitch falls back to the exact S7/S7b geometric behavior.
+#
+# Continuity predicate (_bosch_obj_life_continues): over a graveyard gap of age_s seconds the SAME object's
+# OBJ_LIFE advances by delta=(now-old) mod 2^16 in [1, STEP_MAX*n + MARGIN], where n bounds the sweeps
+# elapsed (age_s / fastest-sweep-dt). A different object is thousands away (or wraps to a huge delta) ->
+# rejected. On an EMPTY/sentinel slot OBJ_LIFE is a high rail (~0xFFF0-0xFFFF), so it is only read for slots
+# with a live range-carrier (never gated on the raw value -- a real counter can sit there just before wrap).
+BOSCH_RADAR_SUB2_MSGS = [h + 2 for h in BOSCH_RADAR_HDR_MSGS]  # 0x282,0x286,...,0x2DE (SUB2 = header+2)
+BOSCH_RADAR_OBJ_LIFE_STEP_MAX = 33     # max legit per-sweep OBJ_LIFE increment (observed max; 92% are +33)
+BOSCH_RADAR_OBJ_LIFE_MARGIN = 6        # slack (parse/timing jitter) added to the continuity upper bound
+BOSCH_RADAR_SWEEP_DT_MIN_S = 0.045     # fastest plausible sweep cadence -> generous sweep-count bound
+# Range residual (after KF motion-compensation) allowed for a stitch when OBJ_LIFE CONFIRMS the identity
+# (recovery of a missed stitch): looser than the geometry-only gate but still bounded (the close-counter
+# tail can only ever align a genuinely range-plausible object). Geometry-only stitches keep the tight gate.
+BOSCH_RADAR_STITCH_RANGE_GATE_LIFE = 5.0  # m
+
 # S3 -- plausibility / self-consistency fault annotations (RX-only; error bits on RadarData, NOT
 # authority changes; NO new frame decoded -- this is the SAFE subset of matrix #18). (a) a decoded dRel
 # outside the physical band [RANGE_MIN, RANGE_MAX] for the declared scale is a decode/scale inconsistency
@@ -395,6 +424,16 @@ def _create_bosch_selected_parser(CP):
   return CANParser(DBC[CP.carFingerprint][Bus.radar], [(BOSCH_RADAR_SELECTED_MSG, 20)], CanBus(CP).camera)
 
 
+def _create_bosch_sub_parser(CP):
+  # S8: ISOLATED parser for the SUB2 sub-frames (OBJ_LIFE per-object identity counter). Kept separate from
+  # the fine-track parser (exactly like _create_bosch_selected_parser) so this RX-only identity telemetry
+  # can NEVER affect the radar's can_valid / fault logic: a missing SUB2 frame only makes OBJ_LIFE
+  # unavailable for that slot (the stitch falls back to pure S7/S7b geometry), it never degrades health.
+  if Bus.radar not in DBC[CP.carFingerprint]:
+    return None
+  return CANParser(DBC[CP.carFingerprint][Bus.radar], [(m, 20) for m in BOSCH_RADAR_SUB2_MSGS], CanBus(CP).camera)
+
+
 class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
@@ -433,6 +472,10 @@ class RadarInterface(RadarInterfaceBase):
     self._graveyard: list[dict] = []
     # S7b: per-slot lateral position of the last valid frame (occupant-swap detection + stitch gating).
     self._last_y: dict[int, float] = {}
+    # S8: per-slot OBJ_LIFE (the radar's per-object identity counter) of the slot's CURRENT tracked
+    # occupant. Updated each cycle a slot is live (mirrors _last_y); read by the graveyard stitch to
+    # corroborate / veto / recover identities. Only ever populated for slots with a live range-carrier.
+    self._acc: dict[int, int] = {}
     # S3 CNTR-stall fault: last seen trigger-slot CNTR and how many cycles it has been frozen.
     self._last_cntr: int | None = None
     self._cntr_stall = 0
@@ -445,12 +488,17 @@ class RadarInterface(RadarInterfaceBase):
     if self.radar_off_can:
       self.rcp = None
       self.rcp_sel = None
+      self.rcp_sub = None
       self.trigger_msg = 0x445
     elif self.bosch_radar:
       self.rcp = _create_bosch_can_parser(CP)
       # RX-only native-Doppler telemetry parser (0x2C8), isolated from self.rcp so it can never affect
       # the radar's can_valid / fault logic. See _create_bosch_selected_parser / vRelNative.
       self.rcp_sel = _create_bosch_selected_parser(CP)
+      # S8 RX-only per-object identity parser (SUB2 OBJ_LIFE), likewise isolated from self.rcp so a
+      # missing SUB2 frame never affects radar health -- it only makes the counter unavailable for that
+      # slot (the stitch falls back to pure S7/S7b geometry). See _create_bosch_sub_parser.
+      self.rcp_sub = _create_bosch_sub_parser(CP)
       # S4 sweep-coherent trigger: the radar emits a 6-slot sweep as a short burst on consecutive header
       # IDs, HEAD-first (0x280 leads, 0x2DC terminates -- confirmed across the bfcar capture: 234 sweeps,
       # 0x280->0x2DC intra-sweep span mean 8.4 ms / max 20.2 ms, well under the ~60 ms inter-sweep
@@ -465,6 +513,7 @@ class RadarInterface(RadarInterfaceBase):
     else:
       self.rcp = _create_nidec_can_parser(CP.carFingerprint)
       self.rcp_sel = None
+      self.rcp_sub = None
       self.trigger_msg = 0x445
     self.updated_messages = set()
 
@@ -482,6 +531,11 @@ class RadarInterface(RadarInterfaceBase):
       # validity does NOT gate anything (a missing 0x2C8 only leaves vRelNative NaN).
       if self.rcp_sel is not None:
         self.rcp_sel.update(can_strings)
+      # S8 RX-only: advance the isolated SUB2 parser so vl[OBJ_LIFE] is fresh at emit time. Its validity
+      # does NOT gate anything (a missing SUB2 frame only makes the per-object counter unavailable, and
+      # the stitch falls back to pure geometry).
+      if self.rcp_sub is not None:
+        self.rcp_sub.update(can_strings)
 
     if self.trigger_msg not in self.updated_messages:
       # Staleness fallback (Bosch fine only): the trigger header (sweep terminator 0x2DC) drives the
@@ -512,6 +566,7 @@ class RadarInterface(RadarInterfaceBase):
     self._pending.clear()
     self._valid_cnt.clear()
     self._last_y.clear()
+    self._acc.clear()
     # Do NOT reset _incarnation here: trackId no-reuse (S1) must hold across a staleness clear too, so a
     # slot that revives after going stale gets a fresh trackId rather than reusing the pre-stale one.
     self._last_trigger_nanos = -1
@@ -534,6 +589,29 @@ class RadarInterface(RadarInterfaceBase):
     self._incarnation[slot] = self._incarnation.get(slot, 0) + 1
     return self._bosch_trackid(slot)
 
+  def _bosch_obj_life(self, slot):
+    # S8: the slot's current SUB2 OBJ_LIFE (per-object identity counter) from the isolated parser, or 0
+    # when unavailable (no SUB2 parser / unheard default). Callers only invoke this for slots with a live
+    # range-carrier this cycle -- on an empty/sentinel slot OBJ_LIFE is a high rail, not a real id.
+    if self.rcp_sub is None:
+      return 0
+    return int(self.rcp_sub.vl[BOSCH_RADAR_SUB2_MSGS[slot]]['OBJ_LIFE'])
+
+  @staticmethod
+  def _bosch_obj_life_continues(acc_old, acc_new, age_s):
+    # S8: does OBJ_LIFE evolve from acc_old to acc_new like the SAME physical object over age_s seconds?
+    # Returns True (continues), False (contradicts -> a DIFFERENT object), or None (either value
+    # unavailable -> caller falls back to geometry). The counter is monotone (mod 2^16) and steps at most
+    # STEP_MAX per sweep, so a same-object gap of n sweeps advances by delta in [1, STEP_MAX*n + MARGIN];
+    # n is bounded above using the FASTEST plausible sweep cadence so a real continuation is never missed.
+    # A different object's seed is thousands away (or the delta wraps to a huge value) -> rejected.
+    # 0 is the isolated parser's unheard default -> unavailable (falsy guard).
+    if not acc_old or not acc_new:
+      return None
+    n = max(1, int(math.ceil(age_s / BOSCH_RADAR_SWEEP_DT_MIN_S)))
+    delta = (int(acc_new) - int(acc_old)) & 0xFFFF
+    return 1 <= delta <= BOSCH_RADAR_OBJ_LIFE_STEP_MAX * n + BOSCH_RADAR_OBJ_LIFE_MARGIN
+
   def _bosch_bury(self, slot):
     # S7: copy a BORN track's identity + kinematics into the graveyard so a re-slotted successor can
     # inherit them. Non-destructive (the caller owns the slot's live state) and idempotent per tid.
@@ -548,7 +626,8 @@ class RadarInterface(RadarInterfaceBase):
     self._graveyard.append({'tid': tid, 'slot': slot, 'kf': kf,
                             'settle': self._settle.get(slot, 0),
                             'valid_cnt': self._valid_cnt.get(slot, 0),
-                            'y': self._last_y.get(slot, float('nan'))})
+                            'y': self._last_y.get(slot, float('nan')),
+                            'acc': self._acc.get(slot)})  # S8: the departing occupant's OBJ_LIFE
 
   def _bosch_is_swap(self, slot, kf, dRel, y, now):
     # S7/S7b occupant-swap test (side-effect-free): the slot's new frame is a DIFFERENT object than its
@@ -564,25 +643,47 @@ class RadarInterface(RadarInterfaceBase):
     return (y_prev is not None and not math.isnan(y_prev)
             and abs(y - y_prev) > BOSCH_RADAR_Y_BREAK_BASE + BOSCH_RADAR_Y_BREAK_SCALE * dRel)
 
-  def _bosch_stitch_pop(self, slot, dRel, now, exclude_tid=None, y=None):
+  def _bosch_stitch_pop(self, slot, dRel, now, exclude_tid=None, y=None, acc=None):
     # S7: find (and consume) the recently-deceased track whose PREDICTED range best matches the new
     # occupant of `slot`. Kills the donor slot's decaying leftover state on a cross-slot hit so the
     # object cannot double-emit from both its old and new slot.
-    best = None
-    best_res = BOSCH_RADAR_STITCH_RANGE_GATE
+    #
+    # S8: the hardware per-object counter OBJ_LIFE (`acc`) is the PRIMARY identity key when available:
+    #  - CONFIRMS a candidate whose counter continues (same object) and then RECOVERS it under a looser
+    #    range gate -- a re-slotted object often shifts range/azimuth past the tight geometric gate while
+    #    its counter continues exactly, so pure geometry would mint a churny fresh id.
+    #  - VETOES a candidate whose counter CONTRADICTS (a different object) even if range/azimuth match.
+    #  - falls back to the exact S7/S7b geometry (tight range + lateral) when the counter is unavailable.
+    # Counter-confirmed candidates outrank geometry-only ones; ties break on range residual.
     y_gate = BOSCH_RADAR_STITCH_Y_GATE_BASE + BOSCH_RADAR_STITCH_Y_GATE_SCALE * dRel
+    best = None
+    best_score = None  # (rank, range_residual); rank 0 = counter-confirmed, 1 = geometry-only
     for g in self._graveyard:
       kf = g['kf']
       age_s = (now - kf.t) * 1e-9
       if not (0.0 <= age_s <= BOSCH_RADAR_STITCH_MAX_AGE_S) or g['tid'] == exclude_tid:
         continue
-      # S7b lateral continuity: range alone cannot separate same-range objects in different lanes
-      gy = g.get('y')
-      if y is not None and gy is not None and not math.isnan(gy) and abs(y - gy) > y_gate:
-        continue
       res = abs(dRel - (kf.r + kf.v * age_s))
-      if res < best_res:
-        best, best_res = g, res
+      life = self._bosch_obj_life_continues(g.get('acc'), acc, age_s)
+      if life is False:
+        continue  # S8 VETO: the counter says a DIFFERENT object -> never stitch, whatever the geometry
+      if life is True:
+        # S8 counter CONFIRMS: recover even past the tight geometry gate (looser range; lateral continuity
+        # not required -- the counter is a stronger identity than azimuth), still bounded in range.
+        if res > BOSCH_RADAR_STITCH_RANGE_GATE_LIFE:
+          continue
+        rank = 0
+      else:
+        # counter UNAVAILABLE -> unchanged S7/S7b geometry: tight range gate + lateral continuity.
+        gy = g.get('y')
+        if y is not None and gy is not None and not math.isnan(gy) and abs(y - gy) > y_gate:
+          continue
+        if res > BOSCH_RADAR_STITCH_RANGE_GATE:
+          continue
+        rank = 1
+      score = (rank, res)
+      if best_score is None or score < best_score:
+        best, best_score = g, score
     if best is not None:
       self._graveyard.remove(best)
       donor = best['slot']
@@ -592,6 +693,7 @@ class RadarInterface(RadarInterfaceBase):
         self._kf.pop(donor, None)
         self._settle.pop(donor, None)
         self._last_y.pop(donor, None)
+        self._acc.pop(donor, None)
         self._valid_cnt[donor] = 0
     return best
 
@@ -610,6 +712,7 @@ class RadarInterface(RadarInterfaceBase):
       self._kf.pop(slot, None)
       self._settle.pop(slot, None)
       self._last_y.pop(slot, None)
+      self._acc.pop(slot, None)
 
   def _bosch_harvest_frames(self, updated_addrs):
     # D1: explode this batch's vl_all (per-signal aligned lists, one entry per parsed frame) into
@@ -742,6 +845,9 @@ class RadarInterface(RadarInterfaceBase):
       # S7b: this frame's lateral position, computed up front for swap detection + stitch gating (it is
       # also the yRel published at emission below).
       yRel = _bosch_lat(dRel, cpt)
+      # S8: this live frame's OBJ_LIFE (the radar's per-object identity counter). Threaded into the
+      # graveyard stitch (corroborate/veto/recover) and stored as this slot's occupant id below.
+      new_acc = self._bosch_obj_life(slot)
 
       # S1 (re)birth detection: a slot whose confidence counter was floored at 0 BEFORE this cycle is a
       # fresh occupant -> bump its incarnation so the trackId it will be published under does not reuse
@@ -750,7 +856,7 @@ class RadarInterface(RadarInterfaceBase):
       # is sighted for BORN_CYCLES-1 cycles before it is ever published, so point-absence would mis-fire.
       was_vacant = self._valid_cnt.get(slot, 0) == 0
       if was_vacant:
-        st = self._bosch_stitch_pop(slot, dRel, now, y=yRel)
+        st = self._bosch_stitch_pop(slot, dRel, now, y=yRel, acc=new_acc)
         if st is not None:
           # S7 stitch: same physical object re-slotted -- inherit its trackId, KF (learned range-rate),
           # confidence and settle run, so it keeps emitting under the same identity with no born/settle
@@ -793,7 +899,7 @@ class RadarInterface(RadarInterfaceBase):
           self._bosch_bury(slot)
           old_tid = self._tid.get(slot)
           self.pts.pop(slot, None)
-          st = self._bosch_stitch_pop(slot, dRel, now, exclude_tid=old_tid, y=yRel)
+          st = self._bosch_stitch_pop(slot, dRel, now, exclude_tid=old_tid, y=yRel, acc=new_acc)
           if st is not None:
             self._tid[slot] = st['tid']
             kf = st['kf']
@@ -825,6 +931,9 @@ class RadarInterface(RadarInterfaceBase):
       # S7b: record this frame's lateral position for next cycle's swap test + burial (also when the
       # point is withheld below -- the slot's occupant was still SEEN here).
       self._last_y[slot] = yRel
+      # S8: record this frame's OBJ_LIFE as this slot's current-occupant id (mirrors _last_y). Read by a
+      # later cycle's graveyard stitch to match this object if it re-slots / drops out and returns.
+      self._acc[slot] = new_acc
 
       # S2 gate: do not emit until the slot is confidently born.
       if self._valid_cnt[slot] < BOSCH_RADAR_BORN_CYCLES:
