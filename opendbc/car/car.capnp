@@ -328,6 +328,13 @@ struct RadarData @0x888ad6581cf0aacb {
     # separately from the (possibly derived) vRel. NaN when unavailable. Kept DISTINCT from vRel so
     # exposing it never changes vRel-based control; consumers (e.g. radard) may fuse it with vRel/vision.
     vRelNative @7 :Float32;
+
+    # the radar's SELECTED-lead (ACC-target) native Doppler for THIS cycle, attached to every emitted
+    # point (a per-cycle scalar), if the radar publishes a selected-lead closing separate from per-track
+    # vRel. Distinct from vRelNative (which is this track's own, slot0-gated); vRelSelected is the same
+    # value on all points so a consumer can use it on WHATEVER slot it fuses as the lead. NaN when there
+    # is no valid selected lead. RX-only reference: exposing it never changes vRel-based control.
+    vRelSelected @8 :Float32;
   }
 
   enum ErrorDEPRECATED {

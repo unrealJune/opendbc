@@ -236,6 +236,42 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertTrue(math.isnan(p_no.vRelNative))
     self.assertFalse(math.isnan(p_yes.vRelNative))
 
+  def test_selected_doppler_exposed_on_all_points(self):
+    # L1: the raw selected-lead (ACC-target) Doppler is attached to EVERY emitted point as vRelSelected
+    # (a per-cycle scalar), so a consumer can use it on whatever slot it fuses -- not just slot0's
+    # agreement-gated vRelNative. Same value on all points; matches the DBC REL_SPEED decode.
+    rr = self._warm_with_sel(3999, 124)
+    self.assertGreater(len(rr.points), 0)
+    expected = -0.7 * 124 + 86.5
+    for p in rr.points:
+      self.assertFalse(math.isnan(p.vRelSelected))
+      self.assertAlmostEqual(p.vRelSelected, expected, places=2)
+    # ungated (unlike vRelNative): a selected Doppler implying hard closing that DISAGREES with a steady
+    # slot0 vRel is still exposed as vRelSelected (the consumer applies its own gate), even though the
+    # agreement-gated vRelNative rejects it.
+    raw_fast = int(round((-20.0 - 86.5) / -0.7))
+    self.ri = _make_ri(); self.bus = self.ri.rcp.bus
+    rr2 = self._warm_with_sel(3999, raw_fast)
+    self.assertTrue(math.isnan(rr2.points[0].vRelNative))
+    self.assertFalse(math.isnan(rr2.points[0].vRelSelected))
+
+  def test_selected_doppler_nan_without_selected_frame(self):
+    # No valid selected lead this cycle -> vRelSelected NaN on all points (RX-only, never fabricated).
+    rr = self._warm(3999)
+    for p in rr.points:
+      self.assertTrue(math.isnan(p.vRelSelected))
+
+  def test_selected_doppler_does_not_change_vrel_or_drel(self):
+    # RX-only guarantee for L1: exposing vRelSelected must not change any published kinematic.
+    rr_no = self._warm(3999)
+    p_no = rr_no.points[0]
+    self.ri = _make_ri(); self.bus = self.ri.rcp.bus
+    rr_yes = self._warm_with_sel(3999, 124)
+    p_yes = rr_yes.points[0]
+    self.assertAlmostEqual(p_no.vRel, p_yes.vRel, places=6)
+    self.assertAlmostEqual(p_no.dRel, p_yes.dRel, places=6)
+    self.assertAlmostEqual(p_no.yRel, p_yes.yRel, places=6)
+
   # ---- S9 in-lane closer-ghost veto (selected-lead Doppler contradicts a fine track's closing) --------
   def _warm_closing_with_sel(self, step, rel_speed_raw, *, lat_raw=0x8000, feed_sel=True, **sel_kw):
     # Drive slot 0 CLOSING (range shrinks `step` raw/cycle -> vRel = -0.00357*step/0.05 m/s) for

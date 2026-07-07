@@ -1013,6 +1013,7 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[slot].trackId = self._tid.get(slot, self._bosch_trackid(slot))
         self.pts[slot].yvRel = float('nan')
         self.pts[slot].vRelNative = float('nan')  # set on slot 0 below when a native Doppler is available
+        self.pts[slot].vRelSelected = float('nan')  # L1: raw selected-lead Doppler, attached to all pts below
 
       self.pts[slot].dRel = dRel
       # yRel = lateral projection of the polar (range, azimuth) measurement (precomputed above via
@@ -1036,6 +1037,16 @@ class RadarInterface(RadarInterfaceBase):
     # r=0.84; see the BOSCH_RADAR_SELECTED_MSG block). Gated by a calibration-free velocity-agreement
     # check so a differently-selected object is not mislabeled. Consumers (radard) fuse it with vision.
     self._bosch_attach_native_doppler()
+
+    # L1 selected-lead Doppler exposure (RX-only): attach the raw per-cycle selected-lead (ACC-target)
+    # Doppler to EVERY point as vRelSelected, so radard can use it on WHATEVER slot it fuses as the lead
+    # -- not just slot 0 (the slot0-gated vRelNative above is blind on ~64% of closer-ghost frames, where
+    # the ghost is a DIFFERENT slot than the ACC pick). Same scalar on all points this cycle; NaN when
+    # there is no valid selected lead. Unlike vRelNative it is ungated (radard applies the agreement gate),
+    # and unlike vRel it is never overwritten -- it is a pure reference the consumer opts into. Setting an
+    # attribute here does not change any published kinematic, so factory AEB/CMBS and control are untouched.
+    for _p in self.pts.values():
+      _p.vRelSelected = sel_dop
 
     # D1: the emit window is consumed; the next window's frames are harvested fresh from vl_all.
     self._pending.clear()
