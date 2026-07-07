@@ -39,6 +39,8 @@ from opendbc.car.honda.radar_interface import (
   BOSCH_RADAR_STITCH_RANGE_GATE,
   BOSCH_RADAR_STITCH_RANGE_GATE_LIFE,
   BOSCH_RADAR_OBJ_LIFE_STEP_MAX,
+  BOSCH_RADAR_RANGE_CAL_K,
+  BOSCH_RADAR_RANGE_CAL_C,
 )
 from opendbc.car.honda.values import CAR, DBC
 
@@ -56,12 +58,17 @@ def _hdr_frame(range_raw, *, tag=BOSCH_RADAR_HDR_TAG, strength=0x00, lat_raw=0x8
                 (lat_raw >> 8) & 0xFF, lat_raw & 0xFF, 0x00, cntr)
 
 
-def _make_ri():
+def _make_ri(range_cal=False):
   CP = structs.CarParams()
   CP.carFingerprint = CAR.HONDA_CIVIC_BOSCH
   CP.radarUnavailable = False
   CP_SP = structs.CarParamsSP()
-  return RadarInterface(CP, CP_SP)
+  ri = RadarInterface(CP, CP_SP)
+  # Pin the RANGE calibration per-instance so tests are deterministic regardless of the SP_RADAR_RANGE_CAL
+  # env default (which is ON in the field). Raw-plumbing tests use the default (off); the dedicated
+  # calibration test passes range_cal=True.
+  ri._range_cal = range_cal
+  return ri
 
 
 def _can(nanos, frames):
@@ -175,6 +182,20 @@ class TestCivicBoschFineParser(unittest.TestCase):
     self.assertTrue(p.measured)
     self.assertFalse(math.isnan(p.vRel))
     self.assertAlmostEqual(p.aRel, 0.0, delta=1.0)
+
+  def test_range_calibration_remaps_published_range(self):
+    # RANGE calibration (env SP_RADAR_RANGE_CAL, ON by default in the field): the PUBLISHED dRel is remapped
+    # to the vision-referenced value dRel/K - C (grows with range) and vRel scales by 1/K, while yRel is
+    # INVARIANT and internal gates ran on RAW range (same born+settle as the uncalibrated case). See the
+    # parser's BOSCH_RADAR_RANGE_CAL block + tmp_radar/RANGECAL_FINDINGS.md.
+    self.ri = _make_ri(range_cal=True)
+    rr = self._warm(3999)   # dead-ahead (lat_raw=0x8000), raw range 0.00357*3999-3 ~= 11.28 m
+    p = rr.points[0]
+    raw = 0.00357 * 3999 - 3.0
+    self.assertAlmostEqual(p.dRel, raw / BOSCH_RADAR_RANGE_CAL_K - BOSCH_RADAR_RANGE_CAL_C, places=4)
+    self.assertGreater(p.dRel, raw)          # calibration pushes the (too-close) lead OUT to true range
+    self.assertAlmostEqual(p.yRel, 0.0, delta=0.05)  # yRel invariant: dead-ahead stays ~0 either way
+    self.assertFalse(math.isnan(p.vRel))
 
   def _sel_frame(self, rel_speed_raw, *, strength=100, sel_range=5000, sel_lat=0x8000, cntr=0x10):
     # 0x2C8 RADAR_SELECTED_0: b0=SEL_STRENGTH, b1=SEL_CNTR_LO, b2:b3=SEL_RANGE, b4:b5=SEL_LAT,

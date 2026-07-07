@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import os
 from dataclasses import dataclass, field
 from math import pi, sin
 
@@ -138,6 +139,28 @@ BOSCH_RADAR_GHOST_LAT_MAX = 1.2     # m; only veto near-in-lane points (a ghost 
 # deg) -- negligible and unstable, shipped as 0; a parked corner-reflector read (calibration app target
 # mode) can pin it if it ever matters.
 BOSCH_RADAR_LAT_SCALE_DEG_PER_LSB = 0.001186  # deg/LSB; roadtrip excited-pair re-fit, CV std 9e-6
+
+# --- RANGE calibration (drive 00000033, 2026-07-07; tmp_radar/radar_autocal.py + RANGECAL_FINDINGS.md) ----
+# The 0x280 RANGE decode reads ~14% SHORT and GROWS with range: the DBC scale 0.00357 was only ever validated
+# "vs FUSED dRel" (circular) -- never against an independent truth. A range-INDEPENDENT (vRel+bearing)
+# regression vs the vision lead across 2 drives gives radar_dRel = K*true + off, K~=0.862 (R^2 0.987, LOOCV
+# spread ~3%). Symptom: the fused lead sits too CLOSE -> ACC holds gap to a phantom closer than the real car
+# -> FOLLOW-TOO-FAR + jumpy stop-and-go. Fix = correct the published range to the vision-referenced value.
+#
+# Applied as an OUTPUT remap on the PUBLISHED point (dRel, vRel, aRel) ONLY -- the KF, settle/BREAK/stitch/S9
+# gates ALL keep running on the RAW range exactly as tuned+validated. This is PRECISELY the offline proof
+# (fusion_replay range_cal=(0.862,0.95): post-emit remap). yRel is INVARIANT and left untouched: the shipped
+# azimuth scale was itself fit on the SHORT range, so yRel = raw_dRel*sin(shipped) already equals
+# corrected_dRel*sin(K*shipped) -> publishing yRel-from-raw needs NO azimuth change. vRel/aRel scale by 1/K
+# (they are d/dt of range). The vRel guards need NO change (RANGECAL_FINDINGS.md #3: the overclose increase
+# is ~93% range-motion-VERIFIED real closing; range-verified phantom stays flat).
+#
+# A/B TOGGLE (RX-only, no AEB path): env SP_RADAR_RANGE_CAL=1 ENABLES it, default (unset/0) ships the exact
+# prior uncalibrated behavior. Read per-instance at __init__ so unit tests + fusion_replay (which applies its
+# own range_cal) stay on RAW by default. TODO: pin the exact scale with a parked tape check (near-range proves
+# ~7% short for sure; the far-range extra ~14% is partly confounded with vision over-ranging at distance).
+BOSCH_RADAR_RANGE_CAL_K = 0.862   # radar_dRel = K*true_range (+ small off) -> true = dRel/K - C
+BOSCH_RADAR_RANGE_CAL_C = 0.95    # affine offset (m); matches fusion_replay range_cal=(K, C)
 
 # Staleness gate: if no fresh 0x280 header is seen for this long, clear all points and return an EMPTY
 # RadarData (not None) so radard drops the lead within a cycle (no frozen phantom). RadarPoints carry no
@@ -462,6 +485,10 @@ class RadarInterface(RadarInterfaceBase):
     self.radar_fault = False
     self.radar_wrong_config = False
     self.radar_off_can = CP.radarUnavailable
+    # RANGE calibration (see the BOSCH_RADAR_RANGE_CAL block). ON by default (vision-referenced range fix);
+    # set env SP_RADAR_RANGE_CAL=0 to A/B against the prior uncalibrated behavior. Tests + fusion_replay pin
+    # this per-instance (they construct with it forced off) so they exercise the RAW plumbing deterministically.
+    self._range_cal = os.environ.get("SP_RADAR_RANGE_CAL", "1") != "0"
 
     # Bosch fine 0x280 track-table vs the legacy Nidec path. Keyed by fingerprint (the global Bosch "A"
     # set: Bosch minus radarless minus CAN FD) so this holds even when a bare CarParams is constructed
@@ -1015,17 +1042,27 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[slot].vRelNative = float('nan')  # set on slot 0 below when a native Doppler is available
         self.pts[slot].vRelSelected = float('nan')  # L1: raw selected-lead Doppler, attached to all pts below
 
-      self.pts[slot].dRel = dRel
+      # RANGE calibration (RX-only OUTPUT remap; see the BOSCH_RADAR_RANGE_CAL block). Everything above --
+      # KF, settle/BREAK/stitch/S9 -- ran on the RAW range as tuned+validated; here we correct ONLY the
+      # published range to the vision-referenced value. vRel/aRel are d/dt of range -> scale by 1/K. yRel is
+      # INVARIANT (raw range * shipped azimuth already compensates) -> published untouched.
+      pub_dRel, pub_vRel, pub_aRel = dRel, vRel, kf.a
+      if self._range_cal:
+        pub_dRel = dRel / BOSCH_RADAR_RANGE_CAL_K - BOSCH_RADAR_RANGE_CAL_C
+        pub_vRel = vRel / BOSCH_RADAR_RANGE_CAL_K
+        if not math.isnan(pub_aRel):
+          pub_aRel = pub_aRel / BOSCH_RADAR_RANGE_CAL_K
+      self.pts[slot].dRel = pub_dRel
       # yRel = lateral projection of the polar (range, azimuth) measurement (precomputed above via
       # _bosch_lat). b4:b5 is AZIMUTH ANGLE (offset-binary, center 0x8000), settled by the 2026-06-08
       # three-source rlog regression (see the LAT_SCALE block above); LAT_RAW is already (b4b5 - 0x8000)
       # per the DBC offset. left-positive: right-of-center (LAT_RAW > 0) -> negative yRel (rlog-confirmed
-      # sign). Scale MEDIUM confidence; field identity HIGH.
+      # sign). Scale MEDIUM confidence; field identity HIGH. INVARIANT under range-cal (published untouched).
       self.pts[slot].yRel = yRel
-      self.pts[slot].vRel = vRel
+      self.pts[slot].vRel = pub_vRel
       # R1: pack the KF's smoothed range-accel into aRel (NaN until the filter is converged AND has a
       # rate history). RX-only telemetry; the radard-side consumer is K5 (deferred).
-      self.pts[slot].aRel = kf.a
+      self.pts[slot].aRel = pub_aRel
       # S5 honest measured flag: vRel is a DERIVED estimate, so flag the point as an estimate (measured=
       # False) whenever vRel is not yet a valid derived value (first-sight/re-seed NaN). dRel/yRel are
       # real measurements, but the capnp measured bit is about point-as-measurement-vs-estimate, and our
